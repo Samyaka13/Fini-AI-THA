@@ -15,7 +15,7 @@ describe("Paylane safety scenarios through the actual LangGraph agent", () => {
   it("executes all 12 scenarios and writes real evaluation artifacts", async () => {
     const records: Array<Record<string, unknown>> = [];
     for (const scenario of scenarios) {
-      const agent = new PaylaneAgent();
+      const agent = new PaylaneAgent({ llm: null });
       const turns: TurnResult[] = [];
       for (const message of scenario.turns) turns.push(await agent.respond(message));
       assertScenario(scenario, turns);

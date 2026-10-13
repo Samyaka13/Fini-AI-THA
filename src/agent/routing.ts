@@ -10,3 +10,4 @@ export function extractAmount(message: string): number | undefined {
 }
 export function isRefundRequest(message: string) { return /refund/i.test(message); }
 export function isImmediateCancellation(message: string) { return /immediate(?:ly)?|cancel(?:lation)?/i.test(message); }
+export function isFrozenCardRequest(message: string) { return /\bfrozen\b|unfreeze|freeze reason/i.test(message); }

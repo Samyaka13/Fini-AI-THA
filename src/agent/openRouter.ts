@@ -21,7 +21,8 @@ const responseSchema = z.object({
 
 /** OpenRouter Chat Completions client for google/gemini-3.8-flash. */
 export class OpenRouterClient implements LlmClient {
-  constructor(private readonly apiKey: string, private readonly fetcher: typeof fetch = fetch) {}
+  constructor(private readonly apiKey: string, 
+    private readonly fetcher: typeof fetch = fetch) {}
 
   static fromEnvironment(): OpenRouterClient | null {
     const apiKey = process.env.OPENROUTER_API_KEY;
