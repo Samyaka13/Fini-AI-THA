@@ -5,3 +5,4 @@
 - `escalate_to_human` accepts `customer_id: null`. This documented schema extension allows a safe anonymous handoff when no matching customer is known; the agent never invents an ID.
 - Unauthorized, stolen-card, and account-takeover reports are conservatively treated as suspected fraud because no independent fraud service exists. Amounts above $500 are marked immediate.
 - `OPENROUTER_API_KEY` configures `google/gemini-3.8-flash` through OpenRouter. Local evaluation stays provider-free and reproducible. A configured LLM receives only redacted conversation text and cannot execute tools directly; `SafeToolExecutor` remains the only execution boundary.
+- A successful partial refund marks its transaction fully refunded for this exercise; a second partial refund is deliberately unsupported.

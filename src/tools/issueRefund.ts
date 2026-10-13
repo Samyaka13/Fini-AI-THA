@@ -7,6 +7,6 @@ export function issueRefund(store: MockStore, txnId: string, amount: number): Is
   if (!transaction) return { ok: false, reason: "transaction_not_found" };
   if (transaction.refunded || transaction.status === "refunded") return { ok: false, reason: "already_refunded" };
   if (transaction.status !== "settled") return { ok: false, reason: "transaction_not_settled" };
-  if (amount <= 0 || amount > 75 || amount > transaction.amount) return { ok: false, reason: "invalid_amount" };
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 75 || amount > transaction.amount) return { ok: false, reason: "invalid_amount" };
   return { ok: true, refund_id: store.recordRefund(transaction, amount).id };
 }

@@ -37,7 +37,7 @@
           "tool": "escalate_to_human",
           "args": {
             "customer_id": "cus_alice",
-            "summary": "age: refund request for txn_exact_30"
+            "summary": "age: refund request"
           },
           "result": {
             "ticket_id": "tkt_0004"

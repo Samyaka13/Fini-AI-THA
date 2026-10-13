@@ -8,7 +8,9 @@
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
     "test:scenarios": "vitest run tests/scenarios",
-    "scenarios": "tsx src/main.ts scenarios"
+    "scenarios": "tsx src/main.ts scenarios",
+    "chat": "tsx src/main.ts",
+    "start": "tsx src/main.ts"
   },
   "dependencies": {
     "@langchain/core": "^0.3.0",

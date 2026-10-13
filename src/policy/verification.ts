@@ -1,9 +1,8 @@
 import type { GetCustomerResult } from "../domain/customer.js";
 import type { SupportSession } from "../domain/session.js";
 
-export type VerificationResult = "missing_details" | "failed" | "verified";
 
-export interface VerificationEvaluation { result: VerificationResult; session: SupportSession; }
+export interface VerificationEvaluation { result: "missing_details" | "failed" | "verified"; session: SupportSession; }
 
 export function verifySession(
   session: SupportSession,

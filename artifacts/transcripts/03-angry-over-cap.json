@@ -37,7 +37,7 @@
           "tool": "escalate_to_human",
           "args": {
             "customer_id": "cus_alice",
-            "summary": "over_cap: refund request for txn_over_cap"
+            "summary": "over_cap: refund request"
           },
           "result": {
             "ticket_id": "tkt_0003"

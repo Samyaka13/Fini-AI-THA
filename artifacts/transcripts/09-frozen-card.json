@@ -21,7 +21,7 @@
           "tool": "escalate_to_human",
           "args": {
             "customer_id": "cus_frozen",
-            "summary": "frozen: customer asks about frozen card"
+            "summary": "frozen-card enquiry"
           },
           "result": {
             "ticket_id": "tkt_0005"

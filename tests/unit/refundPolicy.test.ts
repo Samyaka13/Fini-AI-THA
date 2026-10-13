@@ -18,4 +18,12 @@ describe("refund eligibility", () => {
     expect(refundEligibility({ session: session(), transaction: store.findTransaction("txn_bob"), amount: 20, now: FIXED_NOW, suspectedFraud: false })).toMatchObject({ reason: "not_owner" });
     expect(refundEligibility({ session: session(), transaction: store.findTransaction("txn_recent_40"), amount: 40, now: FIXED_NOW, suspectedFraud: true })).toMatchObject({ reason: "suspected_fraud" });
   });
+  it("rejects non-finite amounts and invalid or future transaction dates", () => {
+    const store = new MockStore(); const transaction = store.findTransaction("txn_recent_40")!;
+    expect(refundEligibility({ session: session(), transaction, amount: Number.NaN, now: FIXED_NOW, suspectedFraud: false })).toMatchObject({ reason: "invalid_amount" });
+    transaction.date = "not-a-date";
+    expect(refundEligibility({ session: session(), transaction, amount: 40, now: FIXED_NOW, suspectedFraud: false })).toMatchObject({ reason: "invalid_transaction_date" });
+    transaction.date = "2026-10-13";
+    expect(refundEligibility({ session: session(), transaction, amount: 40, now: FIXED_NOW, suspectedFraud: false })).toMatchObject({ reason: "invalid_transaction_date" });
+  });
 });
