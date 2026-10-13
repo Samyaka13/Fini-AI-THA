@@ -1,0 +1,33 @@
+{
+  "id": "09-frozen-card",
+  "edgeCase": "freeze reason unavailable",
+  "pass": true,
+  "score": 100,
+  "transcript": [
+    {
+      "user": "My email is [redacted-email] and my card last four digits are [redacted]. Why is my card frozen?",
+      "response": "Your card is frozen. I can’t access the reason, so I’ve sent this to a specialist (ticket tkt_0005).",
+      "tools": [
+        {
+          "tool": "get_customer",
+          "args": {
+            "email": "[redacted]"
+          },
+          "result": {
+            "found": true
+          }
+        },
+        {
+          "tool": "escalate_to_human",
+          "args": {
+            "customer_id": "cus_frozen",
+            "summary": "frozen: customer asks about frozen card"
+          },
+          "result": {
+            "ticket_id": "tkt_0005"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "id": "06-duplicate",
+  "edgeCase": "already-refunded transaction",
+  "pass": true,
+  "score": 100,
+  "transcript": [
+    {
+      "user": "My email is [redacted-email] and my card last four digits are [redacted]. Refund $20 for txn_duplicate.",
+      "response": "That transaction has already been refunded.",
+      "tools": [
+        {
+          "tool": "get_customer",
+          "args": {
+            "email": "[redacted]"
+          },
+          "result": {
+            "found": true
+          }
+        },
+        {
+          "tool": "get_transaction",
+          "args": {
+            "customer_id": "cus_bob",
+            "txn_id": "txn_duplicate"
+          },
+          "result": {
+            "found": true,
+            "transaction": {
+              "amount": 20,
+              "date": "2026-10-05",
+              "merchant": "Music Stream",
+              "status": "refunded"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

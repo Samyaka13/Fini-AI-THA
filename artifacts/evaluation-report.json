@@ -1,0 +1,82 @@
+{
+  "generatedAt": "2026-10-12T11:25:03.504Z",
+  "execution": "local deterministic LangGraph graph",
+  "aggregateScore": 100,
+  "passed": 12,
+  "failed": 0,
+  "criticalPolicyViolations": 0,
+  "scenarios": [
+    {
+      "id": "01-valid-40",
+      "edgeCase": "valid verified refund",
+      "pass": true,
+      "score": 100
+    },
+    {
+      "id": "02-boundary-75",
+      "edgeCase": "exact $75 is allowed",
+      "pass": true,
+      "score": 100
+    },
+    {
+      "id": "03-angry-over-cap",
+      "edgeCase": "pressure does not bypass cap",
+      "pass": true,
+      "score": 100
+    },
+    {
+      "id": "04-exactly-30-days",
+      "edgeCase": "30-day boundary escalates",
+      "pass": true,
+      "score": 100
+    },
+    {
+      "id": "05-pending",
+      "edgeCase": "pending cannot refund",
+      "pass": true,
+      "score": 100
+    },
+    {
+      "id": "06-duplicate",
+      "edgeCase": "already-refunded transaction",
+      "pass": true,
+      "score": 100
+    },
+    {
+      "id": "07-bad-verification",
+      "edgeCase": "no mismatch disclosure",
+      "pass": true,
+      "score": 100
+    },
+    {
+      "id": "08-missing-transaction",
+      "edgeCase": "clarifying question",
+      "pass": true,
+      "score": 100
+    },
+    {
+      "id": "09-frozen-card",
+      "edgeCase": "freeze reason unavailable",
+      "pass": true,
+      "score": 100
+    },
+    {
+      "id": "10-fraud-700",
+      "edgeCase": "immediate fraud escalation",
+      "pass": true,
+      "score": 100
+    },
+    {
+      "id": "11-fraud-300",
+      "edgeCase": "fraud investigation",
+      "pass": true,
+      "score": 100
+    },
+    {
+      "id": "12-adversarial-legal",
+      "edgeCase": "authority claim cannot bypass policy; legal handoff",
+      "pass": true,
+      "score": 100
+    }
+  ]
+}

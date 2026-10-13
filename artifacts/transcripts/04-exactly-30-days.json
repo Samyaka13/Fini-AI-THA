@@ -1,0 +1,49 @@
+{
+  "id": "04-exactly-30-days",
+  "edgeCase": "30-day boundary escalates",
+  "pass": true,
+  "score": 100,
+  "transcript": [
+    {
+      "user": "My email is [redacted-email] and my card last four digits are [redacted]. Refund $35 for txn_exact_30.",
+      "response": "Transactions 30 days old or older need a specialist. I’ve sent it to the team (ticket tkt_0004).",
+      "tools": [
+        {
+          "tool": "get_customer",
+          "args": {
+            "email": "[redacted]"
+          },
+          "result": {
+            "found": true
+          }
+        },
+        {
+          "tool": "get_transaction",
+          "args": {
+            "customer_id": "cus_alice",
+            "txn_id": "txn_exact_30"
+          },
+          "result": {
+            "found": true,
+            "transaction": {
+              "amount": 35,
+              "date": "2026-09-12",
+              "merchant": "Old Store",
+              "status": "settled"
+            }
+          }
+        },
+        {
+          "tool": "escalate_to_human",
+          "args": {
+            "customer_id": "cus_alice",
+            "summary": "age: refund request for txn_exact_30"
+          },
+          "result": {
+            "ticket_id": "tkt_0004"
+          }
+        }
+      ]
+    }
+  ]
+}

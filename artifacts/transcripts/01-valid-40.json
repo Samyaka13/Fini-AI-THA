@@ -1,0 +1,50 @@
+{
+  "id": "01-valid-40",
+  "edgeCase": "valid verified refund",
+  "pass": true,
+  "score": 100,
+  "transcript": [
+    {
+      "user": "My email is [redacted-email] and my card last four digits are [redacted]. Please refund $40 for txn_recent_40.",
+      "response": "Your $40.00 refund has been issued (reference rfd_0001).",
+      "tools": [
+        {
+          "tool": "get_customer",
+          "args": {
+            "email": "[redacted]"
+          },
+          "result": {
+            "found": true
+          }
+        },
+        {
+          "tool": "get_transaction",
+          "args": {
+            "customer_id": "cus_alice",
+            "txn_id": "txn_recent_40"
+          },
+          "result": {
+            "found": true,
+            "transaction": {
+              "amount": 40,
+              "date": "2026-10-05",
+              "merchant": "Metro Market",
+              "status": "settled"
+            }
+          }
+        },
+        {
+          "tool": "issue_refund",
+          "args": {
+            "txn_id": "txn_recent_40",
+            "amount": 40
+          },
+          "result": {
+            "ok": true,
+            "refund_id": "rfd_0001"
+          }
+        }
+      ]
+    }
+  ]
+}
