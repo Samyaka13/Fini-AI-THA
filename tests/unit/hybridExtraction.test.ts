@@ -12,7 +12,7 @@ describe("hybrid deterministic and structured extraction", () => {
       async interpret(input) {
         interpretationCalls += 1;
         expect(input).not.toContain("alice@example.com");
-        return { intent: "refund_request", amount: 40 };
+        return { intent: "refund_request", entities: { email: null, cardLast4: null, transactionId: null, refundAmount: 40 }, needsClarification: false, clarificationReason: null };
       },
     };
     const agent = new PaylaneAgent({ llm });
@@ -27,7 +27,7 @@ describe("hybrid deterministic and structured extraction", () => {
     let interpretationCalls = 0;
     const llm: LlmClient = {
       async complete() { return { content: "", toolCalls: [] }; },
-      async interpret() { interpretationCalls += 1; return { intent: "refund_request", amount: 40 }; },
+      async interpret() { interpretationCalls += 1; return { intent: "refund_request", entities: { email: null, cardLast4: null, transactionId: null, refundAmount: 40 }, needsClarification: false, clarificationReason: null }; },
     };
     const agent = new PaylaneAgent({ llm });
     const result = await agent.respond(`${alice} Refund $30 for txn_recent_40.`);

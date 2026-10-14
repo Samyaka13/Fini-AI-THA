@@ -10,16 +10,24 @@ export interface LlmCompletion {
   content: string | null; 
   toolCalls: LlmToolCall[]; 
 }
+export const entityCandidatesSchema = z.object({
+  email: z.string().nullable(),
+  cardLast4: z.string().nullable(),
+  transactionId: z.string().nullable(),
+  refundAmount: z.number().finite().positive().nullable(),
+});
 export const structuredInterpretationSchema = z.object({
   intent: z.enum(["refund_request", "transaction_lookup", "refund_status", "card_status", "frozen_card_help", "fraud_report", "human_escalation", "account_closure", "legal_action", "unknown"]),
-  amount: z.number().finite().positive().optional(),
-  transactionId: z.string().regex(/^txn_[a-z0-9_]+$/i).optional(),
+  entities: entityCandidatesSchema,
+  needsClarification: z.boolean(),
+  clarificationReason: z.string().nullable(),
 });
+export type EntityCandidates = z.infer<typeof entityCandidatesSchema>;
 export type StructuredInterpretation = z.infer<typeof structuredInterpretationSchema>;
 export interface LlmClient {
   complete(messages: LlmMessage[]): Promise<LlmCompletion>;
   /** Optional low-authority extraction pass for unresolved natural language. */
-  interpret?(sanitizedInput: string): Promise<StructuredInterpretation | null>;
+  interpret?(currentTurn: string): Promise<StructuredInterpretation | null>;
 }
 
 export const OPENROUTER_TOOLS = [
@@ -99,15 +107,15 @@ export class OpenRouterClient implements LlmClient {
       )
     };
   }
-  async interpret(sanitizedInput: string): Promise<StructuredInterpretation | null> {
+  async interpret(currentTurn: string): Promise<StructuredInterpretation | null> {
     const response = await this.fetcher("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: { Authorization: `Bearer ${this.apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         model: "google/gemini-3.8-flash",
         messages: [
-          { role: "system", content: "Classify the support message and extract only candidate intent, positive amount, and transaction ID. Return JSON only. Do not infer identity, verification, approval, or outcomes." },
-          { role: "user", content: sanitizedInput },
+          { role: "system", content: "Classify this one support message and extract only user-provided candidate entities. Return JSON only with intent, entities { email, cardLast4, transactionId, refundAmount }, needsClarification, and clarificationReason. Use null for absent entities. Do not infer, fabricate, verify identity, approve actions, or return a customer ID or outcome." },
+          { role: "user", content: currentTurn },
         ],
         response_format: { type: "json_object" },
         temperature: 0,
@@ -124,5 +132,11 @@ export class OpenRouterClient implements LlmClient {
 export function parseToolArguments(call: LlmToolCall): Record<string, unknown> | null { try { const parsed: unknown = JSON.parse(call.function.arguments); return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null; } catch { return null; } }
 export function sanitizeForLlm(content: string): string {
   if (/^\s*\d{4}\s*$/.test(content)) return "[card-last-four]";
-  return content.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[account-email]").replace(/(?:last\s*(?:four|4)\s*(?:digits)?|card(?:[\s_-]*last\s*4)?)\D{0,12}\d{4}/gi, "[card-last-four]");
+  return content
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[account-email]")
+    .replace(/\bcardlast\s*4\D{0,24}\d{4}/gi, "[card-last-four]")
+    .replace(/last\s*(?:four|4)\s*(?:digits?|numbers?)?\D{0,24}\d{4}/gi, "[card-last-four]")
+    .replace(/card[\s_-]*last\s*4\D{0,24}\d{4}/gi, "[card-last-four]")
+    .replace(/\b(card\b[^.!?\n]{0,24}?)\b\d{4}\b/gi, "$1[card-last-four]")
+    .replace(/\b\d{4}\b\s+(?:are|is)\s+(?:the\s+)?last\s*(?:four|4)\s*(?:digits?|numbers?)\s+(?:of|on)\s+(?:my\s+)?card\b/gi, "[card-last-four]");
 }

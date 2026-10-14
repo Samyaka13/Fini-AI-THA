@@ -22,6 +22,19 @@ describe("OpenRouter integration", () => {
     expect(sanitizeForLlm("email: alice@example.com cardLast4: 4242")).toBe("email: [account-email] [card-last-four]");
     expect(sanitizeForLlm("4821")).not.toContain("4821");
     expect(sanitizeForLlm("Refund $7500 for txn_1234")).toContain("$7500 for txn_1234");
+    expect(sanitizeForLlm("9876 are the last 4 digits of my card")).not.toContain("9876");
+  });
+  it("uses a minimal raw current turn for runtime-validated structured extraction", async () => {
+    let request: RequestInit | undefined;
+    const client = new OpenRouterClient("test-key", async (_url, init) => {
+      request = init;
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ intent: "unknown", entities: { email: "farah@example.com", cardLast4: "9876", transactionId: null, refundAmount: null }, needsClarification: false, clarificationReason: null }) } }] }), { status: 200 });
+    });
+    const result = await client.interpret("farah@example.com; my card tail code is 9876");
+    const body = JSON.parse(String(request?.body));
+    expect(body.messages).toHaveLength(2);
+    expect(body.messages[1]).toEqual({ role: "user", content: "farah@example.com; my card tail code is 9876" });
+    expect(result).toMatchObject({ entities: { email: "farah@example.com", cardLast4: "9876" } });
   });
   it("does not classify a general fraud question as a fraud report", () => {
     expect(assessFraud("How does Paylane prevent fraud?", undefined).suspected).toBe(false);

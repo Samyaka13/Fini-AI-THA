@@ -7,6 +7,9 @@ export interface EscalationContext {
   reason: string;
 }
 
+/** A card question that arrived before the customer completed verification. */
+export type PendingCardIntent = "card_status" | "frozen_card_help";
+
 export interface SupportSession {
   verified: boolean;
   customerId: string | null;
@@ -17,6 +20,8 @@ export interface SupportSession {
   loadedTransactionId: string | null;
   /** Most recent confirmed handoff in this support session. */
   lastEscalation: EscalationContext | null;
+  /** Card-support intent retained only while collecting verification details. */
+  pendingCardIntent: PendingCardIntent | null;
 }
 
 export const newSession = (): SupportSession => ({
@@ -27,4 +32,5 @@ export const newSession = (): SupportSession => ({
   pendingRefund: null,
   loadedTransactionId: null,
   lastEscalation: null,
+  pendingCardIntent: null,
 });

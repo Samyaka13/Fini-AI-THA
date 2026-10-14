@@ -32,4 +32,16 @@ describe("refund amount extraction", () => {
     expect(extractRefundAmount("txn_recent_40")).toBeUndefined();
     expect(isHumanEscalationRequest("Let me speak to a human")).toBe(true);
   });
+
+  it("recognizes explicit descriptor-first and number-first card-last-four wording", () => {
+    expect(extractLast4("9876")).toBe("9876");
+    expect(extractLast4("9876 are the last 4 digits of my card")).toBe("9876");
+    expect(extractLast4("9876 is the last four digits of my card")).toBe("9876");
+    expect(extractLast4("The last 4 digits of my card are 9876")).toBe("9876");
+    expect(extractLast4("My card ends in 9876")).toBe("9876");
+    expect(extractLast4("My card's last four digits are 9876")).toBe("9876");
+    expect(extractLast4("The last four numbers on my card are 9876")).toBe("9876");
+    expect(extractLast4("cardLast4: 9876")).toBe("9876");
+    expect(extractLast4("Refund $40 for txn_recent_40")).toBeNull();
+  });
 });

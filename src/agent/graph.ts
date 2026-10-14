@@ -1,6 +1,6 @@
 import { END, START, StateGraph } from "@langchain/langgraph";
 import { MockStore } from "../data/mockStore.js";
-import { newSession, type SupportSession } from "../domain/session.js";
+import { newSession, type PendingCardIntent, type SupportSession } from "../domain/session.js";
 import type { TransactionView } from "../domain/transaction.js";
 import { mandatoryEscalation } from "../policy/escalationPolicy.js";
 import { assessFraud } from "../policy/fraudPolicy.js";
@@ -10,7 +10,7 @@ import { SafeToolExecutor, type ToolName, type ToolTrace } from "../tools/regist
 import { getCustomerSchema, getTransactionSchema, issueRefundSchema } from "../tools/schemas.js";
 import { FIXED_NOW, ageInWholeDays } from "../utils/dates.js";
 import { deterministicIntent, extractEmail, extractFraudAmount, extractLast4, extractRefundAmount, extractTransactionId, isAccountClosure, isCardStatusInquiry, isFrozenCardRequest, isHumanEscalationRequest, isImmediateCancellation, isLegalAction, isRefundCancellation, isRefundRequest, isTransactionInquiry, type SupportIntent } from "./routing.js";
-import { OpenRouterClient, parseToolArguments, sanitizeForLlm, type LlmClient, type LlmMessage, type LlmToolCall, type StructuredInterpretation } from "./openRouter.js";
+import { OpenRouterClient, parseToolArguments, sanitizeForLlm, structuredInterpretationSchema, type EntityCandidates, type LlmClient, type LlmMessage, type LlmToolCall, type StructuredInterpretation } from "./openRouter.js";
 import { AgentState, type AgentStateValue } from "./state.js";
 import { SYSTEM_PROMPT } from "./systemPrompt.js";
 
@@ -40,9 +40,23 @@ export class PaylaneAgent {
 
   private async runCycle(state: AgentStateValue): Promise<Partial<AgentStateValue>> {
     this.logGraphState("=== TOOL_CYCLE: INPUT STATE ===", state);
+    // The raw current turn is parsed locally first. If that leaves a useful
+    // ambiguity, the small structured-extraction request supplies only
+    // low-authority candidates; reconciliation still happens locally before
+    // session persistence, verification, routing, or tool dispatch.
     const interpretation = await this.getStructuredInterpretation(state.session, state.currentInput);
-    const intent = this.resolveIntent(state.currentInput, interpretation);
-    const prepared = this.updatePendingRefund(state.session, state.currentInput, intent, interpretation);
+    const reconciliation = this.reconcileEntityCandidates(state.session, state.currentInput, interpretation);
+    if (reconciliation.conflicts.length) {
+      return this.finish(state, state.session, `I found conflicting ${reconciliation.conflicts.join(" and ")} details. Please send the correct value again.`, null);
+    }
+    const verifiedSession = this.updateVerificationState(state.session, reconciliation.entities);
+    const detectedIntent = this.resolveIntent(state.currentInput, interpretation);
+    let prepared = this.updatePendingRefund(verifiedSession, state.currentInput, detectedIntent, reconciliation.entities);
+    prepared = this.updatePendingCardIntent(prepared, detectedIntent);
+    const intent = detectedIntent === "unknown" ? prepared.pendingCardIntent ?? "unknown" : detectedIntent;
+    // A session is permanently bound to its verified customer. Do not let an
+    // otherwise ordinary LLM turn turn an identity correction into a switch.
+    if (this.hasIdentityConflict(state.session, state.currentInput)) return this.fallback({ ...state, session: prepared }, null, intent);
     // Read-only transaction/status questions are deterministic. This prevents an
     // LLM from inventing transaction or refund status and does not start a refund.
     if (["fraud_report", "human_escalation", "account_closure", "legal_action", "card_status", "frozen_card_help", "transaction_lookup", "refund_status"].includes(intent)) return this.fallback({ ...state, session: prepared }, null, intent);
@@ -115,15 +129,17 @@ export class PaylaneAgent {
   private dispatchTool(call: LlmToolCall, currentSession: SupportSession, raw: string): { call: LlmToolCall; result: Record<string, unknown>; session: SupportSession } {
     const session = structuredClone(currentSession); const args = parseToolArguments(call); const pending = session.pendingRefund;
     if (!allowedTools.has(call.function.name as ToolName) || !args) return { call, session, result: { ok: false, error: "invalid_tool_request" } };
-    const email = extractEmail(raw); const last4 = extractLast4(raw); const fraud = assessFraud(raw, extractFraudAmount(raw));
+    const fraud = assessFraud(raw, extractFraudAmount(raw));
     if (call.function.name === "get_customer") {
       if (session.verified) {
-        const switchedIdentity = (email && email.toLowerCase() !== (session.suppliedEmail ?? "").toLowerCase()) || (last4 && last4 !== session.suppliedCardLast4);
+        const switchedIdentity = this.hasIdentityConflict(session, raw);
         return { call, session, result: switchedIdentity ? { ok: false, error: "identity_change_requires_new_session" } : { ok: true, verification: "already_verified" } };
       }
-      if (!email || !last4 || !getCustomerSchema.safeParse({ email }).success) return { call, session, result: { ok: false, verification: "missing_details" } };
-      const verification = verifySession(session, email, last4, this.executor.lookupForVerification(email));
-      return { call, session: verification.session, result: { ok: verification.result === "verified", verification: verification.result } };
+      // The model receives redacted history, so it is neither a source of
+      // credentials nor an authorization boundary. Verification is performed
+      // only by updateVerificationState from the raw customer turn.
+      const validArgument = getCustomerSchema.safeParse({ email: args.email }).success && typeof args.email === "string" && !this.isPlaceholder(args.email);
+      return { call, session, result: { ok: false, verification: session.suppliedEmail && session.suppliedCardLast4 ? "failed" : "missing_details", ...(validArgument ? {} : { error: "invalid_verification_request" }) } };
     }
     if (call.function.name === "get_transaction") {
       const requestedTxnId = pending?.transactionId ?? extractTransactionId(raw);
@@ -149,26 +165,32 @@ export class PaylaneAgent {
     }
     if (typeof args.summary !== "string" || !args.summary.trim() || args.summary.length > 500) return { call, session, result: this.executor.recordValidationFailure("escalate_to_human", { summary: "[invalid]" }, "invalid_escalation_request") };
     const summary = args.summary.trim();
-    const customerId = session.verified ? session.customerId : (email ? this.store.findCustomerByEmail(email)?.id ?? null : null);
+    const customerId = session.verified ? session.customerId : (session.suppliedEmail ? this.store.findCustomerByEmail(session.suppliedEmail)?.id ?? null : null);
     const ticket = this.executor.escalate(customerId, summary);
     return { call, session: { ...session, lastEscalation: { ticketId: ticket.ticket_id, reason: "model_requested_handoff" } }, result: { ok: true, ticket_id: ticket.ticket_id } };
   }
 
   private fallback(state: AgentStateValue, llmError: string | null, routedIntent: SupportIntent = deterministicIntent(state.currentInput)): Partial<AgentStateValue> {
-    const raw = state.currentInput; let session = state.session; const email = extractEmail(raw) ?? session.suppliedEmail; const last4 = extractLast4(raw) ?? session.suppliedCardLast4; const fraudAmount = extractFraudAmount(raw); const fraud = assessFraud(raw, fraudAmount);
-    const identityChanged = session.verified && ((extractEmail(raw) && extractEmail(raw)!.toLowerCase() !== (session.suppliedEmail ?? "").toLowerCase()) || (extractLast4(raw) && extractLast4(raw) !== session.suppliedCardLast4));
+    const raw = state.currentInput; let session = state.session; const fraudAmount = extractFraudAmount(raw); const fraud = assessFraud(raw, fraudAmount);
+    const identityChanged = this.hasIdentityConflict(session, raw);
     const escalation = mandatoryEscalation(raw, { fraud: fraud.suspected || routedIntent === "fraud_report", immediateFraud: fraud.immediate, legal: isLegalAction(raw) || routedIntent === "legal_action", closure: isAccountClosure(raw) || routedIntent === "account_closure" });
-    if (escalation) { const customerId = session.verified ? session.customerId : (extractEmail(raw) ? this.store.findCustomerByEmail(extractEmail(raw)!)?.id ?? null : null); const ticket = this.executor.escalate(customerId, `${escalation}: customer request`); return this.finish(state, { ...session, pendingRefund: null, loadedTransactionId: null, lastEscalation: { ticketId: ticket.ticket_id, reason: escalation } }, `I’ve sent this to a support specialist (ticket ${ticket.ticket_id}).${escalation === "fraud_immediate" ? " I’ve marked it for immediate review." : ""}`, llmError); }
+    if (escalation) { const customerId = session.verified ? session.customerId : (session.suppliedEmail ? this.store.findCustomerByEmail(session.suppliedEmail)?.id ?? null : null); const ticket = this.executor.escalate(customerId, `${escalation}: customer request`); return this.finish(state, { ...session, pendingRefund: null, loadedTransactionId: null, lastEscalation: { ticketId: ticket.ticket_id, reason: escalation } }, `I’ve sent this to a support specialist (ticket ${ticket.ticket_id}).${escalation === "fraud_immediate" ? " I’ve marked it for immediate review." : ""}`, llmError); }
     if (isHumanEscalationRequest(raw) || routedIntent === "human_escalation") {
-      const customerId = session.verified ? session.customerId : (extractEmail(raw) ? this.store.findCustomerByEmail(extractEmail(raw)!)?.id ?? null : null);
+      const customerId = session.verified ? session.customerId : (session.suppliedEmail ? this.store.findCustomerByEmail(session.suppliedEmail)?.id ?? null : null);
       const ticket = this.executor.escalate(customerId, "customer requested human support");
       return this.finish(state, { ...session, lastEscalation: { ticketId: ticket.ticket_id, reason: "human_requested" } }, `I’ve sent this to a support specialist (ticket ${ticket.ticket_id}).`, llmError);
     }
     if (identityChanged) return this.finish(state, session, "This support session is verified for a different account. Please start a new session to change account details.", llmError);
-    if (!session.verified) { if (!email || !last4) return this.finish(state, { ...session, suppliedEmail: email, suppliedCardLast4: last4 }, `To help with account or transaction requests, please provide ${!email ? "your account email" : "the last four digits of your card"}.`, llmError); const verification = verifySession(session, email, last4, this.executor.lookupForVerification(email)); session = verification.session; if (verification.result !== "verified") return this.finish(state, session, "I couldn’t verify those details. Please check them and try again.", llmError); }
+    if (!session.verified) {
+      if (!session.suppliedEmail || !session.suppliedCardLast4) return this.finish(state, session, `To help with account or transaction requests, please provide ${!session.suppliedEmail ? "your account email" : "the last four digits of your card"}.`, llmError);
+      // A matching pair is verified by updateVerificationState exactly when a
+      // candidate changes. Repeating this fallback must not generate another
+      // lookup or let a model-triggered retry control verification.
+      return this.finish(state, session, "I couldn’t verify those details. Please check them and try again.", llmError);
+    }
     const customer = session.customerId ? this.store.findCustomerById(session.customerId) : undefined;
     if (isCardStatusInquiry(raw) || routedIntent === "card_status") return this.handleCardStatusInquiry(state, session, llmError);
-    if (customer?.status === "frozen" && (isFrozenCardRequest(raw) || routedIntent === "frozen_card_help")) { const ticket = this.executor.escalate(session.customerId, "frozen-card enquiry"); return this.finish(state, { ...session, pendingRefund: null, loadedTransactionId: null, lastEscalation: { ticketId: ticket.ticket_id, reason: "frozen" } }, `Your card is frozen. I can’t access the reason, so I’ve sent this to a specialist (ticket ${ticket.ticket_id}).`, llmError); }
+    if (customer?.status === "frozen" && (isFrozenCardRequest(raw) || routedIntent === "frozen_card_help")) { const ticket = this.executor.escalate(session.customerId, "frozen-card enquiry"); return this.finish(state, { ...session, pendingRefund: null, loadedTransactionId: null, pendingCardIntent: null, lastEscalation: { ticketId: ticket.ticket_id, reason: "frozen" } }, `Your card is frozen. I can’t access the reason, so I’ve sent this to a specialist (ticket ${ticket.ticket_id}).`, llmError); }
     const pending = session.pendingRefund;
     if (!pending) {
       if (isTransactionInquiry(raw) || routedIntent === "transaction_lookup" || routedIntent === "refund_status") return this.handleTransactionInquiry(state, session, raw, llmError);
@@ -213,16 +235,16 @@ export class PaylaneAgent {
     const refund = this.executor.executeRefund(session, pending.transactionId, pending.requestedAmount, fraud.suspected); return this.finish(state, { ...session, pendingRefund: null, loadedTransactionId: null }, refund.ok ? `Your $${pending.requestedAmount.toFixed(2)} refund has been issued (reference ${refund.refund_id}).` : "I couldn’t issue that refund. A specialist can help.", llmError);
   }
 
-  private updatePendingRefund(base: SupportSession, raw: string, routedIntent: SupportIntent, interpretation: StructuredInterpretation | null = null): SupportSession {
+  private updatePendingRefund(base: SupportSession, raw: string, routedIntent: SupportIntent, entities: EntityCandidates): SupportSession {
     if (isRefundCancellation(raw)) return { ...base, pendingRefund: null, loadedTransactionId: null };
     const continuing = base.pendingRefund !== null; const startsOrContinues = routedIntent === "refund_request" || continuing;
     if (!startsOrContinues) return base;
-    const transactionId = extractTransactionId(raw) ?? (interpretation?.transactionId && raw.toLowerCase().includes(interpretation.transactionId.toLowerCase()) ? interpretation.transactionId : null); const prior = base.pendingRefund ?? { transactionId: null, requestedAmount: null };
+    const transactionId = entities.transactionId; const prior = base.pendingRefund ?? { transactionId: null, requestedAmount: null };
     const amount = extractRefundAmount(raw, { allowBareAmount: Boolean(prior.transactionId && prior.requestedAmount === null) });
     // A model may help with wording such as “please return forty dollars”, but
     // may not resolve competing explicit figures on the customer's behalf.
     const hasConflictingExplicitAmounts = new Set(raw.match(/\$\s*\d+(?:\.\d{1,2})?|\b\d+(?:\.\d{1,2})?\s+(?:dollars?|usd)\b/gi) ?? []).size > 1;
-    const candidateAmount = amount ?? (!hasConflictingExplicitAmounts && prior.transactionId && prior.requestedAmount === null ? interpretation?.amount : undefined);
+    const candidateAmount = amount ?? (!hasConflictingExplicitAmounts && prior.transactionId && prior.requestedAmount === null ? entities.refundAmount ?? undefined : undefined);
     const safeAmount = candidateAmount !== undefined && Number.isFinite(candidateAmount) && candidateAmount > 0 ? candidateAmount : undefined;
     const next = transactionId && transactionId !== prior.transactionId
       ? { ...base, pendingRefund: { transactionId, requestedAmount: safeAmount ?? null }, loadedTransactionId: null }
@@ -230,15 +252,94 @@ export class PaylaneAgent {
     this.logRefundState("pending-refund-updated", next, safeAmount);
     return next;
   }
+  private updateVerificationState(base: SupportSession, entities: EntityCandidates): SupportSession {
+    // A verified session remains bound to the original customer. The caller
+    // handles an explicit identity-change message without replacing credentials.
+    if (base.verified) return base;
+    const email = entities.email && getCustomerSchema.safeParse({ email: entities.email }).success && !this.isPlaceholder(entities.email)
+      ? entities.email.toLowerCase()
+      : null;
+    const last4 = entities.cardLast4 && /^\d{4}$/.test(entities.cardLast4) && !this.isPlaceholder(entities.cardLast4)
+      ? entities.cardLast4
+      : null;
+    const nextEmail = email ?? base.suppliedEmail;
+    const nextLast4 = last4 ?? base.suppliedCardLast4;
+    const changed = nextEmail !== base.suppliedEmail || nextLast4 !== base.suppliedCardLast4;
+    if (!changed) return base;
+    const merged = { ...base, suppliedEmail: nextEmail, suppliedCardLast4: nextLast4 };
+    if (!nextEmail || !nextLast4) return merged;
+    return verifySession(merged, nextEmail, nextLast4, this.executor.lookupForVerification(nextEmail)).session;
+  }
+  private reconcileEntityCandidates(session: SupportSession, raw: string, interpretation: StructuredInterpretation | null): { entities: EntityCandidates; conflicts: string[] } {
+    const deterministic: EntityCandidates = {
+      email: extractEmail(raw),
+      cardLast4: extractLast4(raw),
+      transactionId: extractTransactionId(raw),
+      refundAmount: extractRefundAmount(raw, { allowBareAmount: Boolean(session.pendingRefund?.transactionId && session.pendingRefund.requestedAmount === null) }) ?? null,
+    };
+    const structured = interpretation?.entities;
+    const conflicts: string[] = [];
+    const resolve = (name: string, deterministicValue: string | number | null, structuredValue: string | number | null, validStructured: (value: string | number) => boolean): string | number | null => {
+      if (deterministicValue !== null && structuredValue !== null && deterministicValue !== structuredValue) {
+        conflicts.push(name);
+        return null;
+      }
+      if (deterministicValue !== null) return deterministicValue;
+      return structuredValue !== null && validStructured(structuredValue) ? structuredValue : null;
+    };
+    const email = resolve("email", deterministic.email, structured?.email ?? null, (value) => typeof value === "string" && getCustomerSchema.safeParse({ email: value }).success && this.isCandidateInRaw(raw, value));
+    const cardLast4 = resolve("card last four", deterministic.cardLast4, structured?.cardLast4 ?? null, (value) => typeof value === "string" && /^\d{4}$/.test(value) && this.isCardCandidateInRaw(raw, value));
+    const transactionId = resolve("transaction", deterministic.transactionId, structured?.transactionId ?? null, (value) => typeof value === "string" && /^txn_[a-z0-9_]+$/i.test(value) && this.isCandidateInRaw(raw, value));
+    const refundAmount = resolve("refund amount", deterministic.refundAmount, structured?.refundAmount ?? null, (value) => typeof value === "number" && Number.isFinite(value) && value > 0 && this.isRefundAmountGrounded(raw));
+    return {
+      entities: {
+        email: typeof email === "string" ? email : null,
+        cardLast4: typeof cardLast4 === "string" ? cardLast4 : null,
+        transactionId: typeof transactionId === "string" ? transactionId : null,
+        refundAmount: typeof refundAmount === "number" ? refundAmount : null,
+      },
+      conflicts,
+    };
+  }
+  private isCandidateInRaw(raw: string, value: string): boolean { return raw.toLowerCase().includes(value.toLowerCase()); }
+  private isCardCandidateInRaw(raw: string, value: string): boolean {
+    const fourDigitValues = raw.match(/\b\d{4}\b/g) ?? [];
+    return fourDigitValues.length === 1 && new RegExp(`\\b${value}\\b`).test(raw) && /\b(?:card|last|digit|number|ends?|tail)\b/i.test(raw);
+  }
+  private isRefundAmountGrounded(raw: string): boolean {
+    return /\b(?:refund|return|back)\b/i.test(raw) && /(?:\$\s*\d|\b\d+(?:\.\d{1,2})?\s*(?:dollars?|usd)\b|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)\b)/i.test(raw);
+  }
+  private updatePendingCardIntent(session: SupportSession, intent: SupportIntent): SupportSession {
+    if (intent === "card_status" || intent === "frozen_card_help") return { ...session, pendingCardIntent: intent as PendingCardIntent };
+    if (intent !== "unknown") return { ...session, pendingCardIntent: null };
+    return session;
+  }
+  private hasIdentityConflict(session: SupportSession, raw: string): boolean {
+    if (!session.verified) return false;
+    const email = extractEmail(raw);
+    const last4 = extractLast4(raw);
+    return Boolean(
+      (email && !this.isPlaceholder(email) && email.toLowerCase() !== (session.suppliedEmail ?? "").toLowerCase()) ||
+      (last4 && !this.isPlaceholder(last4) && last4 !== session.suppliedCardLast4),
+    );
+  }
+  private isPlaceholder(value: string): boolean { return /^\s*\[(?:account-email|card-last-four)\]\s*$/i.test(value); }
   private async getStructuredInterpretation(session: SupportSession, raw: string): Promise<StructuredInterpretation | null> {
     if (!this.llm?.interpret || !this.needsStructuredInterpretation(session, raw)) return null;
-    try { return await this.llm.interpret(sanitizeForLlm(raw)); } catch { return null; }
+    // This request contains the current turn only. Conversation history remains
+    // redacted, and the result is treated as an untrusted candidate below.
+    try { return structuredInterpretationSchema.safeParse(await this.llm.interpret(raw)).data ?? null; } catch { return null; }
   }
   private needsStructuredInterpretation(session: SupportSession, raw: string): boolean {
-    // Deterministic extraction wins for explicit values. The model is only asked
-    // to interpret an unresolved phrase, never to verify or authorize anything.
-    if (deterministicIntent(raw) !== "unknown") return false;
+    // Deterministic extraction wins for explicit values. Ask the extractor only
+    // when a value-shaped phrase remains unresolved, or routing needs language
+    // interpretation; it never verifies or authorizes anything.
+    const unresolvedEmail = !extractEmail(raw) && /@/.test(raw);
+    const unresolvedCard = !extractLast4(raw) && /\b\d{4}\b/.test(raw) && /\b(?:card|last|digits?|numbers?|ends?|tail)\b/i.test(raw);
+    if (!session.verified && (unresolvedEmail || unresolvedCard)) return true;
+    if (session.verified && (unresolvedEmail || unresolvedCard)) return false;
     if (extractEmail(raw) || extractLast4(raw) || extractTransactionId(raw)) return false;
+    if (deterministicIntent(raw) !== "unknown") return false;
     if (extractRefundAmount(raw, { allowBareAmount: Boolean(session.pendingRefund?.transactionId && session.pendingRefund.requestedAmount === null) }) !== undefined) return false;
     return session.pendingRefund?.requestedAmount === null || !isRefundRequest(raw);
   }
@@ -254,19 +355,20 @@ export class PaylaneAgent {
     return this.finish(state, session, this.describeTransaction(found.transaction), llmError);
   }
   private handleCardStatusInquiry(state: AgentStateValue, session: SupportSession, llmError: string | null): Partial<AgentStateValue> {
+    const completedSession = { ...session, pendingCardIntent: null };
     const status = this.executor.getVerifiedCardStatus(session);
     if (!status.found) {
-      if (session.lastEscalation) return this.finish(state, session, `I can’t currently confirm your card status. Your existing support ticket (${session.lastEscalation.ticketId}) remains with the specialist.`, llmError);
+      if (session.lastEscalation) return this.finish(state, completedSession, `I can’t currently confirm your card status. Your existing support ticket (${session.lastEscalation.ticketId}) remains with the specialist.`, llmError);
       const ticket = this.executor.escalate(session.customerId, "card-status unavailable");
-      return this.finish(state, { ...session, lastEscalation: { ticketId: ticket.ticket_id, reason: "card_status_unavailable" } }, `I can’t currently confirm your card status, so I’ve sent it to a specialist (ticket ${ticket.ticket_id}).`, llmError);
+      return this.finish(state, { ...completedSession, lastEscalation: { ticketId: ticket.ticket_id, reason: "card_status_unavailable" } }, `I can’t currently confirm your card status, so I’ve sent it to a specialist (ticket ${ticket.ticket_id}).`, llmError);
     }
     if (status.status === "active") {
       const followUp = session.lastEscalation ? ` Your earlier support case (${session.lastEscalation.ticketId}) remains with the specialist.` : "";
-      return this.finish(state, session, `The account record currently shows your card as active.${followUp}`, llmError);
+      return this.finish(state, completedSession, `The account record currently shows your card as active.${followUp}`, llmError);
     }
-    if (session.lastEscalation) return this.finish(state, session, `The account record shows your card as frozen. I can’t access the reason. Your existing support ticket (${session.lastEscalation.ticketId}) remains with the specialist.`, llmError);
+    if (session.lastEscalation) return this.finish(state, completedSession, `The account record shows your card as frozen. I can’t access the reason. Your existing support ticket (${session.lastEscalation.ticketId}) remains with the specialist.`, llmError);
     const ticket = this.executor.escalate(session.customerId, "frozen-card status enquiry");
-    return this.finish(state, { ...session, lastEscalation: { ticketId: ticket.ticket_id, reason: "frozen" } }, `The account record shows your card as frozen. I can’t access the reason, so I’ve sent this to a specialist (ticket ${ticket.ticket_id}).`, llmError);
+    return this.finish(state, { ...completedSession, lastEscalation: { ticketId: ticket.ticket_id, reason: "frozen" } }, `The account record shows your card as frozen. I can’t access the reason, so I’ve sent this to a specialist (ticket ${ticket.ticket_id}).`, llmError);
   }
   private describeTransaction(transaction: TransactionView): string {
     const details = `The transaction was ${transaction.status} for $${transaction.amount.toFixed(2)} at ${transaction.merchant} on ${transaction.date}.`;
