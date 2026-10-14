@@ -25,7 +25,8 @@ npm run chat        # Start the interactive terminal agent
 npm run scenarios   # Run the evaluation scenarios and refresh artifacts
 ```
 
-The app works without an API key for tests and deterministic flows. Set `OPENROUTER_API_KEY` in `.env` to enable the OpenRouter-backed conversational model.
+Add an env file in the route and add open router API key there name of env variable is mentioned in the env example
+
 
 ## Architecture and assumptions
 
