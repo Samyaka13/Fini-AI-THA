@@ -1,7 +1,7 @@
 import { END, START, StateGraph } from "@langchain/langgraph";
 import { MockStore } from "../data/mockStore.js";
 import { newSession, type PendingCardIntent, type SupportSession } from "../domain/session.js";
-import type { TransactionView } from "../domain/transaction.js";
+import type { TransactionRecord, TransactionView } from "../domain/transaction.js";
 import { mandatoryEscalation } from "../policy/escalationPolicy.js";
 import { assessFraud } from "../policy/fraudPolicy.js";
 import { refundEligibility } from "../policy/refundPolicy.js";
@@ -9,7 +9,7 @@ import { verifySession } from "../policy/verification.js";
 import { SafeToolExecutor, type ToolName, type ToolTrace } from "../tools/registry.js";
 import { getCustomerSchema, getTransactionSchema, issueRefundSchema } from "../tools/schemas.js";
 import { FIXED_NOW, ageInWholeDays } from "../utils/dates.js";
-import { deterministicIntent, extractEmail, extractFraudAmount, extractLast4, extractRefundAmount, extractTransactionId, isAccountClosure, isCardStatusInquiry, isFrozenCardRequest, isHumanEscalationRequest, isImmediateCancellation, isLegalAction, isRefundCancellation, isRefundRequest, isTransactionInquiry, type SupportIntent } from "./routing.js";
+import { deterministicIntent, extractEmail, extractFraudAmount, extractLast4, extractRefundAmount, extractTransactionId, isAccountClosure, isCapabilityInquiry, isCardStatusInquiry, isFrozenCardRequest, isFullRefundRequest, isHumanEscalationRequest, isImmediateCancellation, isLegalAction, isRefundCancellation, isRefundReferenceInquiry, isRefundRequest, isTransactionInquiry, type SupportIntent } from "./routing.js";
 import { OpenRouterClient, parseToolArguments, sanitizeForLlm, structuredInterpretationSchema, type EntityCandidates, type LlmClient, type LlmMessage, type LlmToolCall, type StructuredInterpretation } from "./openRouter.js";
 import { AgentState, type AgentStateValue } from "./state.js";
 import { SYSTEM_PROMPT } from "./systemPrompt.js";
@@ -57,25 +57,55 @@ export class PaylaneAgent {
     // A session is permanently bound to its verified customer. Do not let an
     // otherwise ordinary LLM turn turn an identity correction into a switch.
     if (this.hasIdentityConflict(state.session, state.currentInput)) return this.fallback({ ...state, session: prepared }, null, intent);
-    // Read-only transaction/status questions are deterministic. This prevents an
-    // LLM from inventing transaction or refund status and does not start a refund.
-    if (["fraud_report", "human_escalation", "account_closure", "legal_action", "card_status", "frozen_card_help", "transaction_lookup", "refund_status"].includes(intent)) return this.fallback({ ...state, session: prepared }, null, intent);
-    if (!this.llm) return this.fallback({ ...state, session: prepared }, null, intent);
+    // Mandatory safety paths remain manager/policy owned. Ordinary verified
+    // transaction and refund requests continue to the LLM tool-selection loop.
+    if (["fraud_report", "human_escalation", "account_closure", "legal_action", "card_status", "frozen_card_help"].includes(intent)) return this.fallback({ ...state, session: prepared }, null, intent);
+    // A current pending request referring to the most recently verified
+    // transaction, or explicitly asking for its full amount, has enough trusted
+    // context for the manager to apply policy directly. It must not depend on
+    // an LLM to reconstruct “the above transaction” or authorize a refund.
+    if (this.shouldResolvePendingRefund(state.currentInput, prepared)) return this.fallback({ ...state, session: prepared }, null, intent);
+    // Do not let the LLM speculate with incomplete refund state. The manager
+    // owns the lookup, terminal-state checks, and the focused missing-field
+    // question before any refund tool call can be considered.
+    if (this.hasIncompletePendingRefund(prepared)) return this.fallback({ ...state, session: prepared }, null, intent);
+    if (prepared.lastEscalation && this.isEscalationBypassAttempt(state.currentInput)) {
+      return this.finish(state, prepared, `I can’t bypass the refund policy or issue this automatically. Your existing support ticket (${prepared.lastEscalation.ticketId}) remains with the specialist.`, null);
+    }
+    // Verification gates access to account-specific actions, not ordinary
+    // conversation.  Let the model answer a greeting or a general question
+    // about Paylane support from sanitized history, while this manager still
+    // owns every path that can read or change customer data.
+    if (!this.llm || (!prepared.verified && this.requiresVerifiedSession(intent))) {
+      return this.fallback({ ...state, session: prepared }, null, intent);
+    }
+    if (this.isRecentRefundFollowUp(state.currentInput, prepared)) return this.handleRecentRefundFollowUp(state, prepared, null);
+    if (this.isRecentTransactionFollowUp(state.currentInput, prepared)) return this.handleRecentTransactionFollowUp(state, prepared, null);
     let messages = [...state.messages]; let session = prepared; const calls: LlmToolCall[] = []; const traceStart = state.traceStart;
     try {
       for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration += 1) {
         const completion = await this.llm.complete(messages); calls.push(...completion.toolCalls);
-        messages = [...messages, { role: "assistant", content: completion.content, ...(completion.toolCalls.length ? { tool_calls: completion.toolCalls } : {}) }];
         if (!completion.toolCalls.length) {
-          if (session.pendingRefund) return this.fallback({ ...state, messages: messages.slice(0, -1), session, llmToolCalls: calls }, null, intent);
-          const response = this.safeFinalResponse(completion.content, session, this.executor.traces.slice(traceStart), state.currentInput, traceStart);
-          return { messages, response, session, traces: this.executor.traces.slice(traceStart), llmToolCalls: calls, llmError: null };
+          if (session.pendingRefund) return this.fallback({ ...state, messages, session, llmToolCalls: calls }, null, intent);
+          if (!completion.content?.trim() || this.isUnusableModelResponse(completion.content, session)) {
+            return this.fallback({ ...state, messages, session, llmToolCalls: calls }, null, intent);
+          }
+          const response = this.safeFinalResponse(completion.content, this.executor.traces.slice(traceStart));
+          // Do not retain an empty or rejected model fragment.  It is neither a
+          // useful conversation turn nor an answer the application endorsed.
+          const completedMessages = completion.content === response
+            ? [...messages, { role: "assistant" as const, content: completion.content }]
+            : messages;
+          return { messages: completedMessages, response, session, traces: this.executor.traces.slice(traceStart), llmToolCalls: calls, llmError: null };
         }
+        messages = [...messages, { role: "assistant", content: completion.content, tool_calls: completion.toolCalls }];
         // Calls are deliberately dispatched in order. A later call can only see
         // trusted state established by an earlier call in this same completion.
         const results: Array<{ call: LlmToolCall; result: Record<string, unknown>; session: SupportSession }> = [];
         for (const call of completion.toolCalls) {
+          const traceCount = this.executor.traces.length;
           const result = this.dispatchTool(call, session, state.currentInput);
+          this.executor.traces.slice(traceCount).forEach((trace) => { trace.origin = "llm"; });
           session = result.session;
           results.push(result);
         }
@@ -153,7 +183,7 @@ export class PaylaneAgent {
         return { call, session: lookup.session, result: lookup.alreadyLoaded ? { ok: true, transaction_status: "already_loaded" } : lookup.found ? { ok: true, transaction: lookup.transaction } : { ok: false, error: lookup.reason } };
       }
       const found = this.executor.getOwnedTransaction(session, requestedTxnId);
-      return { call, session, result: "transaction" in found ? { ok: true, transaction: found.transaction } : { ok: false, error: found.reason } };
+      return { call, session: "transaction" in found ? { ...session, lastReferencedTransactionId: requestedTxnId } : session, result: "transaction" in found ? { ok: true, transaction: found.transaction } : { ok: false, error: found.reason } };
     }
     if (call.function.name === "issue_refund") {
       if (!pending?.transactionId || pending.requestedAmount === null || !issueRefundSchema.safeParse(args).success || args.txn_id !== pending.transactionId || args.amount !== pending.requestedAmount) {
@@ -165,6 +195,11 @@ export class PaylaneAgent {
     }
     if (typeof args.summary !== "string" || !args.summary.trim() || args.summary.length > 500) return { call, session, result: this.executor.recordValidationFailure("escalate_to_human", { summary: "[invalid]" }, "invalid_escalation_request") };
     const summary = args.summary.trim();
+    // Safety-policy escalation is handled in fallback(). A model cannot create
+    // a ticket merely because its own refund tool call was rejected, and a retry
+    // cannot duplicate an already-confirmed handoff.
+    if (pending) return { call, session, result: this.executor.recordValidationFailure("escalate_to_human", { summary }, "refund_requires_policy_resolution") };
+    if (session.lastEscalation) return { call, session, result: this.executor.recordValidationFailure("escalate_to_human", { summary }, "escalation_already_created") };
     const customerId = session.verified ? session.customerId : (session.suppliedEmail ? this.store.findCustomerByEmail(session.suppliedEmail)?.id ?? null : null);
     const ticket = this.executor.escalate(customerId, summary);
     return { call, session: { ...session, lastEscalation: { ticketId: ticket.ticket_id, reason: "model_requested_handoff" } }, result: { ok: true, ticket_id: ticket.ticket_id } };
@@ -174,13 +209,18 @@ export class PaylaneAgent {
     const raw = state.currentInput; let session = state.session; const fraudAmount = extractFraudAmount(raw); const fraud = assessFraud(raw, fraudAmount);
     const identityChanged = this.hasIdentityConflict(session, raw);
     const escalation = mandatoryEscalation(raw, { fraud: fraud.suspected || routedIntent === "fraud_report", immediateFraud: fraud.immediate, legal: isLegalAction(raw) || routedIntent === "legal_action", closure: isAccountClosure(raw) || routedIntent === "account_closure" });
-    if (escalation) { const customerId = session.verified ? session.customerId : (session.suppliedEmail ? this.store.findCustomerByEmail(session.suppliedEmail)?.id ?? null : null); const ticket = this.executor.escalate(customerId, `${escalation}: customer request`); return this.finish(state, { ...session, pendingRefund: null, loadedTransactionId: null, lastEscalation: { ticketId: ticket.ticket_id, reason: escalation } }, `I’ve sent this to a support specialist (ticket ${ticket.ticket_id}).${escalation === "fraud_immediate" ? " I’ve marked it for immediate review." : ""}`, llmError); }
+    if (escalation) {
+      if (session.lastEscalation?.reason === escalation) return this.finish(state, session, `Your existing support ticket (${session.lastEscalation.ticketId}) remains with the specialist.`, llmError);
+      const customerId = session.verified ? session.customerId : (session.suppliedEmail ? this.store.findCustomerByEmail(session.suppliedEmail)?.id ?? null : null); const ticket = this.executor.escalate(customerId, `${escalation}: customer request`); this.markLatestTrace("policy"); return this.finish(state, { ...session, pendingRefund: null, loadedTransactionId: null, lastEscalation: { ticketId: ticket.ticket_id, reason: escalation } }, `I’ve sent this to a support specialist (ticket ${ticket.ticket_id}).${escalation === "fraud_immediate" ? " I’ve marked it for immediate review." : ""}`, llmError);
+    }
     if (isHumanEscalationRequest(raw) || routedIntent === "human_escalation") {
+      if (session.lastEscalation?.reason === "human_requested") return this.finish(state, session, `Your existing support ticket (${session.lastEscalation.ticketId}) remains with the specialist.`, llmError);
       const customerId = session.verified ? session.customerId : (session.suppliedEmail ? this.store.findCustomerByEmail(session.suppliedEmail)?.id ?? null : null);
       const ticket = this.executor.escalate(customerId, "customer requested human support");
       return this.finish(state, { ...session, lastEscalation: { ticketId: ticket.ticket_id, reason: "human_requested" } }, `I’ve sent this to a support specialist (ticket ${ticket.ticket_id}).`, llmError);
     }
     if (identityChanged) return this.finish(state, session, "This support session is verified for a different account. Please start a new session to change account details.", llmError);
+    if (isCapabilityInquiry(raw)) return this.finish(state, session, "I can help with transaction lookups, refund requests and refund references, card-status questions, suspected fraud, and connecting you with a support specialist. Account-specific help requires verification with your account email and card last four digits.", llmError);
     if (!session.verified) {
       if (!session.suppliedEmail || !session.suppliedCardLast4) return this.finish(state, session, `To help with account or transaction requests, please provide ${!session.suppliedEmail ? "your account email" : "the last four digits of your card"}.`, llmError);
       // A matching pair is verified by updateVerificationState exactly when a
@@ -191,6 +231,7 @@ export class PaylaneAgent {
     const customer = session.customerId ? this.store.findCustomerById(session.customerId) : undefined;
     if (isCardStatusInquiry(raw) || routedIntent === "card_status") return this.handleCardStatusInquiry(state, session, llmError);
     if (customer?.status === "frozen" && (isFrozenCardRequest(raw) || routedIntent === "frozen_card_help")) { const ticket = this.executor.escalate(session.customerId, "frozen-card enquiry"); return this.finish(state, { ...session, pendingRefund: null, loadedTransactionId: null, pendingCardIntent: null, lastEscalation: { ticketId: ticket.ticket_id, reason: "frozen" } }, `Your card is frozen. I can’t access the reason, so I’ve sent this to a specialist (ticket ${ticket.ticket_id}).`, llmError); }
+    if (this.isRecentRefundFollowUp(raw, session)) return this.handleRecentRefundFollowUp(state, session, llmError);
     const pending = session.pendingRefund;
     if (!pending) {
       if (isTransactionInquiry(raw) || routedIntent === "transaction_lookup" || routedIntent === "refund_status") return this.handleTransactionInquiry(state, session, raw, llmError);
@@ -203,8 +244,10 @@ export class PaylaneAgent {
       // treated as a continuation rather than a fresh, re-verified request.
       return this.finish(state, { ...session, pendingRefund: { transactionId: null, requestedAmount: pending.requestedAmount }, loadedTransactionId: null }, "I can’t find that transaction for this account. Please check the transaction ID and send the correct one.", llmError);
     }
-    if (pending.requestedAmount === null) return this.finish(state, session, "What refund amount are you requesting?", llmError);
     const transaction = this.store.findTransaction(pending.transactionId)!;
+    const terminalResponse = this.handleTerminalRefundState(state, session, transaction, llmError);
+    if (terminalResponse) return terminalResponse;
+    if (pending.requestedAmount === null) return this.finish(state, session, "What refund amount are you requesting?", llmError);
     // The automatic cap applies to the original charge as well as the request;
     // a smaller requested amount cannot turn a $120 transaction into a safe
     // automatic refund.
@@ -212,10 +255,10 @@ export class PaylaneAgent {
     const exceedsTransaction = pending.requestedAmount > transaction.amount;
     const partialRequest = pending.requestedAmount < transaction.amount;
     if (required) {
-      const amountNote = exceedsTransaction ? " Requested amount exceeds the original transaction amount." : partialRequest ? " Automatic refunds must be for the full original transaction amount." : "";
-      const ticket = this.executor.escalate(session.customerId, `${required}: refund request${exceedsTransaction ? "; requested amount exceeds original transaction amount" : partialRequest ? "; partial refunds are not allowed" : ""}`);
+      const amountNote = exceedsTransaction ? "Requested amount exceeds the original transaction amount." : partialRequest ? "Automatic refunds must be for the full original transaction amount." : "";
+      const ticket = this.executor.escalate(session.customerId, `${required}: refund request${exceedsTransaction ? "; requested amount exceeds original transaction amount" : partialRequest ? "; partial refunds are not allowed" : ""}`); this.markLatestTrace("policy");
       const explanation = required === "over_cap" ? "Transactions above $75 need a specialist." : required === "age" ? "Transactions 30 days old or older need a specialist." : "This request needs a specialist.";
-      return this.finish(state, { ...session, pendingRefund: null, loadedTransactionId: null, lastEscalation: { ticketId: ticket.ticket_id, reason: required } }, `${amountNote}${explanation} I’ve sent it to the team (ticket ${ticket.ticket_id}).`, llmError);
+      return this.finish(state, { ...session, pendingRefund: null, loadedTransactionId: null, lastReferencedTransactionId: pending.transactionId, lastEscalation: { ticketId: ticket.ticket_id, reason: required } }, [amountNote, explanation, `I’ve sent it to the team (ticket ${ticket.ticket_id}).`].filter(Boolean).join(" "), llmError);
     }
     const decision = refundEligibility({ session, transaction, amount: pending.requestedAmount, now: this.executor.now(), suspectedFraud: fraud.suspected });
     if (!decision.eligible) {
@@ -227,8 +270,8 @@ export class PaylaneAgent {
         : decision.reason === "partial_not_allowed" ? "Automatic refunds must be for the full original transaction amount. I’ve sent this to a specialist."
         : "I can’t complete that refund request.";
       if (decision.reason === "partial_not_allowed") {
-        const ticket = this.executor.escalate(session.customerId, "partial refund request; full refund required");
-        return this.finish(state, { ...session, pendingRefund: null, loadedTransactionId: null, lastEscalation: { ticketId: ticket.ticket_id, reason: "partial_refund" } }, `${explanation} (ticket ${ticket.ticket_id}).`, llmError);
+        const ticket = this.executor.escalate(session.customerId, "partial refund request; full refund required"); this.markLatestTrace("policy");
+        return this.finish(state, { ...session, pendingRefund: null, loadedTransactionId: null, lastReferencedTransactionId: pending.transactionId, lastEscalation: { ticketId: ticket.ticket_id, reason: "partial_refund" } }, `${explanation} (ticket ${ticket.ticket_id}).`, llmError);
       }
       return this.finish(state, { ...session, pendingRefund: decision.reason === "pending" ? session.pendingRefund : null, loadedTransactionId: decision.reason === "pending" ? session.loadedTransactionId : null }, explanation, llmError);
     }
@@ -239,18 +282,69 @@ export class PaylaneAgent {
     if (isRefundCancellation(raw)) return { ...base, pendingRefund: null, loadedTransactionId: null };
     const continuing = base.pendingRefund !== null; const startsOrContinues = routedIntent === "refund_request" || continuing;
     if (!startsOrContinues) return base;
-    const transactionId = entities.transactionId; const prior = base.pendingRefund ?? { transactionId: null, requestedAmount: null };
+    const prior = base.pendingRefund ?? { transactionId: null, requestedAmount: null };
+    const transactionId = entities.transactionId ?? (this.isRecentTransactionReference(raw) ? base.lastReferencedTransactionId : null);
     const amount = extractRefundAmount(raw, { allowBareAmount: Boolean(prior.transactionId && prior.requestedAmount === null) });
     // A model may help with wording such as “please return forty dollars”, but
     // may not resolve competing explicit figures on the customer's behalf.
     const hasConflictingExplicitAmounts = new Set(raw.match(/\$\s*\d+(?:\.\d{1,2})?|\b\d+(?:\.\d{1,2})?\s+(?:dollars?|usd)\b/gi) ?? []).size > 1;
-    const candidateAmount = amount ?? (!hasConflictingExplicitAmounts && prior.transactionId && prior.requestedAmount === null ? entities.refundAmount ?? undefined : undefined);
+    const fullTransactionId = transactionId ?? prior.transactionId;
+    const fullAmount = isFullRefundRequest(raw) ? this.getTrustedFullRefundAmount(base, fullTransactionId) : undefined;
+    const candidateAmount = amount ?? fullAmount ?? (!hasConflictingExplicitAmounts && prior.transactionId && prior.requestedAmount === null ? entities.refundAmount ?? undefined : undefined);
     const safeAmount = candidateAmount !== undefined && Number.isFinite(candidateAmount) && candidateAmount > 0 ? candidateAmount : undefined;
     const next = transactionId && transactionId !== prior.transactionId
       ? { ...base, pendingRefund: { transactionId, requestedAmount: safeAmount ?? null }, loadedTransactionId: null }
       : { ...base, pendingRefund: { transactionId: prior.transactionId, requestedAmount: safeAmount ?? prior.requestedAmount } };
     this.logRefundState("pending-refund-updated", next, safeAmount);
     return next;
+  }
+  private isRecentTransactionReference(raw: string): boolean {
+    return /\b(?:above|that|this|previous|prior|last)\s+(?:transaction|charge|payment)\b|\b(?:the\s+)?(?:transaction|charge|payment)\s+above\b|\b(?:refund|return)\b[^.!?]{0,32}\b(?:this|that|it|above)\b/i.test(raw);
+  }
+  private getTrustedFullRefundAmount(session: SupportSession, transactionId: string | null): number | undefined {
+    if (!session.verified || !session.customerId || !transactionId) return undefined;
+    const transaction = this.store.findTransaction(transactionId);
+    return transaction?.customerId === session.customerId ? transaction.amount : undefined;
+  }
+  private shouldResolvePendingRefund(raw: string, session: SupportSession): boolean {
+    const pending = session.pendingRefund;
+    return Boolean(pending && (isFullRefundRequest(raw) || this.isRecentTransactionReference(raw)));
+  }
+  private hasIncompletePendingRefund(session: SupportSession): boolean {
+    return Boolean(session.pendingRefund && (session.pendingRefund.transactionId === null || session.pendingRefund.requestedAmount === null));
+  }
+  private requiresVerifiedSession(intent: SupportIntent): boolean {
+    return ["refund_request", "transaction_lookup", "refund_status"].includes(intent);
+  }
+  private isEscalationBypassAttempt(raw: string): boolean {
+    return /\b(?:bypass|override|ignore)\s+(?:the\s+)?(?:policy|rule)|\b(?:i(?:'m|\s+am)\s+(?:the\s+)?developer|developer\s+testing)|\b(?:issue|process)\b[^.!?]{0,48}\b(?:anyway|regardless|won'?t\s+affect)\b/i.test(raw);
+  }
+  private handleTerminalRefundState(state: AgentStateValue, session: SupportSession, transaction: TransactionRecord, llmError: string | null): Partial<AgentStateValue> | null {
+    const pending = session.pendingRefund;
+    if (!pending?.transactionId) return null;
+    const completed = { ...session, pendingRefund: null, loadedTransactionId: null, lastReferencedTransactionId: pending.transactionId };
+    if (transaction.refunded || transaction.status === "refunded") {
+      const refund = this.store.findRefundByTransaction(transaction.id);
+      return this.finish(state, completed, this.describeRefundStatus(refund?.id ?? null, refund?.amount ?? null), llmError);
+    }
+    if (transaction.status === "pending") {
+      if (isImmediateCancellation(state.currentInput)) {
+        if (session.lastEscalation?.reason === "pending_urgent") return this.finish(state, session, `Your existing support ticket (${session.lastEscalation.ticketId}) remains with the specialist.`, llmError);
+        const ticket = this.executor.escalate(session.customerId, "pending transaction requires immediate cancellation review"); this.markLatestTrace("policy");
+        return this.finish(state, { ...completed, lastEscalation: { ticketId: ticket.ticket_id, reason: "pending_urgent" } }, `That transaction is still pending, so it can’t be refunded until it settles. I’ve sent the immediate-cancellation request to a specialist (ticket ${ticket.ticket_id}).`, llmError);
+      }
+      return this.finish(state, completed, "That transaction is still pending, so it can’t be refunded until it settles.", llmError);
+    }
+    const ageDays = ageInWholeDays(transaction.date, this.executor.now());
+    const reason = transaction.amount > 75 ? "over_cap" : ageDays !== null && ageDays >= 30 ? "age" : null;
+    if (!reason) return null;
+    if (session.lastEscalation?.reason === reason) return this.finish(state, completed, `Your existing support ticket (${session.lastEscalation.ticketId}) remains with the specialist.`, llmError);
+    const isPartial = pending.requestedAmount !== null && pending.requestedAmount < transaction.amount;
+    const exceedsTransaction = pending.requestedAmount !== null && pending.requestedAmount > transaction.amount;
+    const ticket = this.executor.escalate(session.customerId, `${reason}: refund request${exceedsTransaction ? "; requested amount exceeds original transaction amount" : isPartial ? "; partial refunds are not allowed" : ""}`); this.markLatestTrace("policy");
+    const amountNote = exceedsTransaction ? "Requested amount exceeds the original transaction amount." : isPartial ? "Automatic refunds must be for the full original transaction amount." : "";
+    const explanation = reason === "over_cap" ? "Transactions above $75 need a specialist." : "Transactions 30 days old or older need a specialist.";
+    return this.finish(state, { ...completed, lastEscalation: { ticketId: ticket.ticket_id, reason } }, [amountNote, explanation, `I’ve sent it to the team (ticket ${ticket.ticket_id}).`].filter(Boolean).join(" "), llmError);
   }
   private updateVerificationState(base: SupportSession, entities: EntityCandidates): SupportSession {
     // A verified session remains bound to the original customer. The caller
@@ -290,7 +384,7 @@ export class PaylaneAgent {
     const email = resolve("email", deterministic.email, structured?.email ?? null, (value) => typeof value === "string" && getCustomerSchema.safeParse({ email: value }).success && this.isCandidateInRaw(raw, value));
     const cardLast4 = resolve("card last four", deterministic.cardLast4, structured?.cardLast4 ?? null, (value) => typeof value === "string" && /^\d{4}$/.test(value) && this.isCardCandidateInRaw(raw, value));
     const transactionId = resolve("transaction", deterministic.transactionId, structured?.transactionId ?? null, (value) => typeof value === "string" && /^txn_[a-z0-9_]+$/i.test(value) && this.isCandidateInRaw(raw, value));
-    const refundAmount = resolve("refund amount", deterministic.refundAmount, structured?.refundAmount ?? null, (value) => typeof value === "number" && Number.isFinite(value) && value > 0 && this.isRefundAmountGrounded(raw));
+    const refundAmount = resolve("refund amount", deterministic.refundAmount, structured?.refundAmount ?? null, (value) => typeof value === "number" && Number.isFinite(value) && value > 0 && this.isRefundAmountGrounded(raw, session));
     return {
       entities: {
         email: typeof email === "string" ? email : null,
@@ -306,8 +400,9 @@ export class PaylaneAgent {
     const fourDigitValues = raw.match(/\b\d{4}\b/g) ?? [];
     return fourDigitValues.length === 1 && new RegExp(`\\b${value}\\b`).test(raw) && /\b(?:card|last|digit|number|ends?|tail)\b/i.test(raw);
   }
-  private isRefundAmountGrounded(raw: string): boolean {
-    return /\b(?:refund|return|back)\b/i.test(raw) && /(?:\$\s*\d|\b\d+(?:\.\d{1,2})?\s*(?:dollars?|usd)\b|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)\b)/i.test(raw);
+  private isRefundAmountGrounded(raw: string, session: SupportSession): boolean {
+    const explicitAmount = /(?:\$\s*\d|\b\d+(?:\.\d{1,2})?\s*(?:bucks|dollas|dollars?|usd)\b|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)\b)/i.test(raw);
+    return explicitAmount && (/\b(?:refund|return|back)\b/i.test(raw) || Boolean(session.pendingRefund?.transactionId && session.pendingRefund.requestedAmount === null));
   }
   private updatePendingCardIntent(session: SupportSession, intent: SupportIntent): SupportSession {
     if (intent === "card_status" || intent === "frozen_card_help") return { ...session, pendingCardIntent: intent as PendingCardIntent };
@@ -340,6 +435,9 @@ export class PaylaneAgent {
     if (session.verified && (unresolvedEmail || unresolvedCard)) return false;
     if (extractEmail(raw) || extractLast4(raw) || extractTransactionId(raw)) return false;
     if (deterministicIntent(raw) !== "unknown") return false;
+    // A general question is best answered directly by the conversational
+    // model.  It has no low-authority entity candidates to extract first.
+    if (isCapabilityInquiry(raw)) return false;
     if (extractRefundAmount(raw, { allowBareAmount: Boolean(session.pendingRefund?.transactionId && session.pendingRefund.requestedAmount === null) }) !== undefined) return false;
     return session.pendingRefund?.requestedAmount === null || !isRefundRequest(raw);
   }
@@ -352,7 +450,33 @@ export class PaylaneAgent {
     if (!txnId) return this.finish(state, session, "Please share the transaction ID so I can look it up.", llmError);
     const found = this.executor.getOwnedTransaction(session, txnId);
     if (!("transaction" in found)) return this.finish(state, session, "I can’t find that transaction for this account.", llmError);
-    return this.finish(state, session, this.describeTransaction(found.transaction), llmError);
+    return this.finish(state, { ...session, lastReferencedTransactionId: txnId }, this.describeTransaction(found.transaction), llmError);
+  }
+  private isRecentTransactionFollowUp(raw: string, session: SupportSession): boolean {
+    return Boolean(
+      session.lastReferencedTransactionId &&
+      !extractTransactionId(raw) &&
+      /\b(?:original\s+)?(?:transaction|charge|payment)\s+amount\b|\boriginal\s+amount\b/i.test(raw),
+    );
+  }
+  private isRecentRefundFollowUp(raw: string, session: SupportSession): boolean {
+    return Boolean(session.lastReferencedTransactionId && !extractTransactionId(raw) && isRefundReferenceInquiry(raw));
+  }
+  private handleRecentRefundFollowUp(state: AgentStateValue, session: SupportSession, llmError: string | null): Partial<AgentStateValue> {
+    const txnId = session.lastReferencedTransactionId;
+    if (!txnId) return this.finish(state, session, "Please share the transaction ID so I can look it up.", llmError);
+    const found = this.executor.getOwnedTransaction(session, txnId);
+    if (!("transaction" in found)) return this.finish(state, session, "I can’t find that transaction for this account.", llmError);
+    return this.finish(state, session, found.transaction.refund
+      ? `The refund reference is ${found.transaction.refund.id} for $${found.transaction.refund.amount.toFixed(2)}.`
+      : "No refund has been issued for that transaction.", llmError);
+  }
+  private handleRecentTransactionFollowUp(state: AgentStateValue, session: SupportSession, llmError: string | null): Partial<AgentStateValue> {
+    const txnId = session.lastReferencedTransactionId;
+    if (!txnId) return this.finish(state, session, "Please share the transaction ID so I can look it up.", llmError);
+    const found = this.executor.getOwnedTransaction(session, txnId);
+    if (!("transaction" in found)) return this.finish(state, session, "I can’t find that transaction for this account.", llmError);
+    return this.finish(state, session, `The original transaction amount was $${found.transaction.amount.toFixed(2)}.`, llmError);
   }
   private handleCardStatusInquiry(state: AgentStateValue, session: SupportSession, llmError: string | null): Partial<AgentStateValue> {
     const completedSession = { ...session, pendingCardIntent: null };
@@ -385,7 +509,7 @@ export class PaylaneAgent {
     if (session.loadedTransactionId === txnId) return { session, found: true, alreadyLoaded: true };
     const found = this.executor.getOwnedTransaction(session, txnId);
     if (!("transaction" in found)) return { session, found: false, alreadyLoaded: false, reason: found.reason };
-    return { session: { ...session, loadedTransactionId: txnId }, found: true, alreadyLoaded: false, transaction: found.transaction };
+    return { session: { ...session, loadedTransactionId: txnId, lastReferencedTransactionId: txnId }, found: true, alreadyLoaded: false, transaction: found.transaction };
   }
   private logRefundState(stage: string, session: SupportSession, parsedAmount: number | undefined): void {
     if (process.env.PAYLANE_DEBUG !== "true") return;
@@ -393,6 +517,10 @@ export class PaylaneAgent {
   }
   private logToolDecision(tool: ToolName, details: Record<string, boolean>): void {
     if (process.env.PAYLANE_DEBUG === "true") console.debug("[tool-validation]", { tool, ...details });
+  }
+  private markLatestTrace(origin: "manager" | "policy"): void {
+    const latest = this.executor.traces.at(-1);
+    if (latest) latest.origin = origin;
   }
   private logGraphState(label: string, state: AgentStateValue): void {
     // Keep the labels and workflow visibility of the original diagnostics, while
@@ -423,8 +551,7 @@ export class PaylaneAgent {
       currentInput: "[trusted input omitted]",
     }, { depth: null });
   }
-  private safeFinalResponse(content: string | null, session: SupportSession, traces: ToolTrace[], currentInput: string, traceStart: number): string {
-    if (!content?.trim()) return this.fallback({ messages: [], response: "", session, traces: [], llmToolCalls: [], llmError: null, currentInput, traceStart }, null).response ?? "I need a little more information to help.";
+  private safeFinalResponse(content: string, traces: ToolTrace[]): string {
     const successfulRefund = traces.some((trace) => trace.tool === "issue_refund" && trace.result.ok === true);
     const successfulTicket = traces.some((trace) => trace.tool === "escalate_to_human" && typeof trace.result.ticket_id === "string");
     if (/(refund.*issued|ticket.*created|sent.*specialist)/i.test(content) && !successfulRefund && !successfulTicket) return "I can’t confirm that action yet. Please provide the requested details so I can continue.";
@@ -434,6 +561,19 @@ export class PaylaneAgent {
       if (latestTransaction && latestTransaction.result.found === false) return "I can’t find that transaction for this account. Please check the transaction ID and try again.";
     }
     return content;
+  }
+  private isUnusableModelResponse(content: string, session: SupportSession): boolean {
+    const asksForVerification = /\b(?:provide|share|send|confirm|enter)\b[^.!?]{0,100}\b(?:email|card|last\s*(?:four|4)|digits?)\b/i.test(content);
+    // A provider can occasionally return a cut-off request such as “could you
+    // please provide”. Returning it is misleading, and it must not become part
+    // of the next model-visible history turn.
+    const trailingRequest = /\b(?:please\s+)?(?:provide|share|send|confirm|enter)\s*$/i.test(content);
+    // Providers can also stop partway through a sentence or Markdown bullet.
+    // Treat these fragments like an empty result rather than persisting text
+    // such as "- **Support &" as a customer-facing answer.
+    const unmatchedBoldMarker = (content.match(/\*\*/g) ?? []).length % 2 !== 0;
+    const hangingEnding = /(?:[&/,:;]|\b(?:and|or|with|for|to))\s*$/i.test(content);
+    return trailingRequest || unmatchedBoldMarker || hangingEnding || (session.verified && asksForVerification);
   }
   private recordResponse(state: AgentStateValue): Partial<AgentStateValue> { const last = state.messages.at(-1); return last?.role === "assistant" && !last.tool_calls && last.content === state.response ? {} : { messages: [...state.messages, { role: "assistant", content: state.response }] }; }
   private finish(state: AgentStateValue, session: SupportSession, response: string, llmError: string | null): Partial<AgentStateValue> { return { messages: state.messages, session, response, traces: this.executor.traces.slice(state.traceStart), llmToolCalls: state.llmToolCalls, llmError }; }

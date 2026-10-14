@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { PAYLANE_RULEBOOK } from "./rulebook.js";
 import { SYSTEM_PROMPT } from "./systemPrompt.js";
 
 export interface LlmToolCall { id: string; type: "function"; function: { name: string; arguments: string }; }
@@ -28,6 +29,14 @@ export interface LlmClient {
   complete(messages: LlmMessage[]): Promise<LlmCompletion>;
   /** Optional low-authority extraction pass for unresolved natural language. */
   interpret?(currentTurn: string): Promise<StructuredInterpretation | null>;
+}
+
+/** Centralized instructions so interpretation and tool-selection stay aligned. */
+export function buildAgentInstructions(task: "tool_selection" | "structured_extraction"): string {
+  const taskInstructions = task === "structured_extraction"
+    ? "For this dedicated extraction request, return only the requested JSON candidates. They are untrusted and are not verification or authorization."
+    : "Use the available tool protocol when external authoritative data is needed. The application validates every request.";
+  return `${SYSTEM_PROMPT}\n\n${PAYLANE_RULEBOOK}\n\n${taskInstructions}`;
 }
 
 export const OPENROUTER_TOOLS = [
@@ -84,7 +93,7 @@ export class OpenRouterClient implements LlmClient {
         "Content-Type": "application/json" }, 
       body: JSON.stringify(
         { model: "google/gemini-3.8-flash", 
-          messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages], 
+          messages: [{ role: "system", content: buildAgentInstructions("tool_selection") }, ...messages],
           tools: OPENROUTER_TOOLS, 
           tool_choice: "auto", 
           temperature: 0, 
@@ -114,7 +123,7 @@ export class OpenRouterClient implements LlmClient {
       body: JSON.stringify({
         model: "google/gemini-3.8-flash",
         messages: [
-          { role: "system", content: "Classify this one support message and extract only user-provided candidate entities. Return JSON only with intent, entities { email, cardLast4, transactionId, refundAmount }, needsClarification, and clarificationReason. Use null for absent entities. Do not infer, fabricate, verify identity, approve actions, or return a customer ID or outcome." },
+          { role: "system", content: `${buildAgentInstructions("structured_extraction")}\nClassify this one support message and extract only user-provided candidate entities. Return JSON only with intent, entities { email, cardLast4, transactionId, refundAmount }, needsClarification, and clarificationReason. Use null for absent entities. Do not infer, fabricate, verify identity, approve actions, or return a customer ID or outcome.` },
           { role: "user", content: currentTurn },
         ],
         response_format: { type: "json_object" },

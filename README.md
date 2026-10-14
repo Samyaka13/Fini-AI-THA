@@ -1,28 +1,34 @@
 # Paylane AI Support Agent
 
-A TypeScript customer-support agent for a fictional fintech app. It uses a single LangGraph workflow and four in-memory mock API tools. Financial and privacy controls are deterministic application code, not prompt-only rules.
+A TypeScript support agent for a consumer-fintech demo. It supports verified transaction lookups, policy-controlled refunds, card-status support, fraud reporting, and human handoff.
 
-## Run
+## Set up and run
+
+Requires Node.js 20 or later.
 
 ```bash
 npm install
-cp .env.example .env # optional OpenRouter configuration; no key is needed for local tests
+cp .env.example .env # optional: add OPENROUTER_API_KEY for live LLM responses
 npm run build
 npm test
 npm run chat
-npm run scenarios -- "My email is alice@example.com and my card last four digits are 4242. Refund $40 for txn_recent_40."
 ```
 
-`npm test` runs unit tests plus all twelve LangGraph scenario tests. It writes sanitized execution transcripts to `artifacts/transcripts/` and refreshes the evaluation report. Set `OPENROUTER_API_KEY` in your local ignored `.env` to use `google/gemini-3.8-flash` through OpenRouter. The graph uses the OpenRouter tool-calling protocol with a four-iteration cap; deterministic verification, ownership, fraud, and refund checks remain authoritative.
+Use `/reset` in chat to start a new session and `/exit` to quit.
 
-`npm run chat` (or `npm start`) starts a continuous terminal conversation. Use `/reset` to begin a new support session or `/exit` to close it.
+## Commands
 
-## Security and extraction model
+```bash
+npm run build       # Type-check the project
+npm test            # Run unit tests and the 12 evaluation scenarios
+npm run chat        # Start the interactive terminal agent
+npm run scenarios   # Run the evaluation scenarios and refresh artifacts
+```
 
-The agent uses a hybrid interpretation flow. It first deterministically extracts email addresses, card last-four digits, transaction IDs, explicit monetary amounts, and common refund/card intents from the trusted user input. When a value or intent remains genuinely unclear, the OpenRouter client may request a small JSON-only structured interpretation of the already-sanitized message. That result is only a candidate: it is runtime-validated, reconciled with the current session, and never establishes identity, ownership, eligibility, or a successful action. Explicit deterministic evidence wins; unresolved conflicts require clarification.
+The app works without an API key for tests and deterministic flows. Set `OPENROUTER_API_KEY` in `.env` to enable the OpenRouter-backed conversational model.
 
-Verification, transaction ownership, fraud escalation, and all refund decisions are application-enforced. OpenRouter never receives an email address or card last-four value. Terminal graph diagnostics retain their original lifecycle labels but redact trusted input and verification fields.
+## Architecture and assumptions
 
-The current automatic-refund policy is deliberately full-refund-only: the customer must explicitly request the entire original settled charge; the original charge must be positive and no more than $75, less than 30 days old, owned by the verified customer, and not already refunded. Partial requests, larger original charges, and transactions at least 30 days old are not automatically refunded and are routed to a specialist where required.
+The LangGraph manager owns session state, verification, refund policy, and all tool authorization. The LLM handles natural-language replies and ordinary tool selection, but cannot verify a customer or execute a tool directly. The four mock tools are `get_customer`, `get_transaction`, `issue_refund`, and `escalate_to_human`.
 
-See `docs/RULEBOOK.md`, `docs/ARCHITECTURE.md`, and `docs/ASSUMPTIONS.md` for behavior and limits.
+Email and card last-four values must match one trusted record before account details are discussed. Conversation history is redacted for ordinary model calls; accepted verification details remain only in trusted session state. Refunds are full-transaction only: the original settled charge must be $75 or less, under 30 days old, owned by the verified customer, and not previously refunded. Pending, partial, duplicate, over-cap, fraud, and 30-day-or-older cases are safely declined or escalated. Anonymous escalation is allowed with a `null` customer ID, and tests use a fixed clock for date boundaries.

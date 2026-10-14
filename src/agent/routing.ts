@@ -4,9 +4,9 @@ export type SupportIntent = "refund_request" | "transaction_lookup" | "refund_st
 
 export function extractEmail(message: string): string | null { return message.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0] ?? null; }
 export function extractLast4(message: string): string | null {
-  const descriptorFirst = /(?:last\s*(?:four|4)\s*(?:digits?|numbers?)?|card[\s_-]*last\s*4)\D{0,24}\b(\d{4})\b/i.exec(message)?.[1];
+  const descriptorFirst = /(?:last\s*(?:(?:four|4)\s*)?(?:digits?|numbers?)|card[\s_-]*last\s*4)\D{0,24}\b(\d{4})\b/i.exec(message)?.[1];
   const cardEndsIn = /\b(?:my\s+)?card(?:'s)?\s+(?:ends\s+in|last\s*(?:four|4)\s*(?:digits?|numbers?))\s*(?:are|is|:)?\s*(\d{4})\b/i.exec(message)?.[1];
-  const numberFirst = /\b(\d{4})\b\s+(?:are|is)\s+(?:the\s+)?last\s*(?:four|4)\s*(?:digits?|numbers?)\s+(?:of|on)\s+(?:my\s+)?card\b/i.exec(message)?.[1];
+  const numberFirst = /\b(\d{4})\b\s+(?:are|is)\s+(?:the\s+)?last\s*(?:(?:four|4)\s*)?(?:digits?|numbers?)\s+(?:of|on)\s+(?:my\s+)?card\w*\b/i.exec(message)?.[1];
   return descriptorFirst ?? cardEndsIn ?? numberFirst ?? (message.trim().match(/^\d{4}$/)?.[0] ?? null);
 }
 export function extractTransactionId(message: string): string | null { return message.match(/txn_[a-z0-9_]+/i)?.[0] ?? null; }
@@ -31,7 +31,7 @@ export function extractRefundAmount(message: string, options: { allowBareAmount?
   // details as money.
   const loneDollarAmount = message.match(/^\s*\$\s*(\d+(?:\.\d{1,2})?)\s*[.!?]?\s*$/);
   if (loneDollarAmount) matches.push(Number(loneDollarAmount[1]));
-  if (options.allowBareAmount && /^\s*\$?\s*(\d+(?:\.\d{1,2})?)\s*(?:dollars?|usd)?\s*[.!?]?\s*$/i.test(message)) {
+  if (options.allowBareAmount && /^\s*\$?\s*(\d+(?:\.\d{1,2})?)\s*(?:dollars?|usd)?(?:\s+(?:full(?:\s+(?:amount|refund))?|amount\s+in\s+full))?\s*[.!?]?\s*$/i.test(message)) {
     const bare = Number(message.match(/^\s*\$?\s*(\d+(?:\.\d{1,2})?)/)?.[1]);
     if (Number.isFinite(bare)) matches.push(bare);
   }
@@ -39,14 +39,21 @@ export function extractRefundAmount(message: string, options: { allowBareAmount?
   return unique.length === 1 ? unique[0] : undefined;
 }
 export function isRefundCancellation(message: string): boolean { return /\b(?:cancel|withdraw)\s+(?:my\s+)?refund(?:\s+request)?\b/i.test(message); }
-export function isRefundStatusInquiry(message: string): boolean { return /\b(?:refund\s+status|status\s+of\s+(?:my\s+)?refund|look\s+into\s+(?:my\s+)?refunds?)\b/i.test(message); }
+export function isRefundReferenceInquiry(message: string): boolean { return /\b(?:refund\s+(?:id|reference)|(?:id|reference)\s+(?:for|of)\s+(?:the\s+)?(?:above\s+)?refund)\b/i.test(message); }
+export function isRefundStatusInquiry(message: string): boolean { return /\b(?:refund\s+status|status\s+of\s+(?:my\s+)?refund|look\s+into\s+(?:my\s+)?refunds?)\b/i.test(message) || isRefundReferenceInquiry(message); }
+export function isFullRefundRequest(message: string): boolean {
+  return /\b(?:full|entire|whole)\s+refund\b|\brefund\s+(?:the\s+)?(?:full|entire|whole)\s+(?:amount|transaction)\b/i.test(message);
+}
 export function isTransactionInquiry(message: string): boolean {
   return isRefundStatusInquiry(message) || Boolean(extractTransactionId(message)) || /\b(?:transaction|charge|payment)\s+(?:status|details?|information)\b/i.test(message);
 }
 export function isCardStatusInquiry(message: string): boolean {
-  return /\b(?:what(?:'s|\s+is)|(?:i\s+)?(?:need|want)\s+(?:help\s+)?(?:to\s+)?know|help)\s+(?:with\s+)?(?:the\s+)?status\s+of\s+(?:my\s+|the\s+)?card\b|\b(?:my\s+)?card\s+status\b|\b(?:is|has)\s+(?:my\s+)?card\s+(?:is\s+)?(?:active|frozen|freezen|blocked)\b|\b(?:my\s+)?card\s+(?:is\s+)?(?:active|frozen|freezen|blocked)\b|\bcan\s+i\s+use\s+(?:my\s+)?card\b|\b(?:active|frozen|freezen|blocked)\s+or\s+(?:active|frozen|freezen|blocked)\b/i.test(message);
+  return /\bstatus\s+of\s+(?:my\s+|the\s+)?card\b|\b(?:my\s+|the\s+)?card\s+status\b|\b(?:is|has)\s+(?:my\s+)?card\s+(?:is\s+)?(?:active|frozen|freezen|blocked)\b|\b(?:my\s+)?card\s+(?:is\s+)?(?:active|frozen|freezen|blocked)\b|\bcan\s+i\s+use\s+(?:my\s+)?card\b|\b(?:active|frozen|freezen|blocked)\s+or\s+(?:active|frozen|freezen|blocked)\b/i.test(message);
 }
-export function isHumanEscalationRequest(message: string): boolean { return /\b(?:speak|talk|connect)\s+(?:to|with)\s+(?:a\s+)?(?:human|person|agent|representative)|\bhuman\s+(?:support|help|agent)\b/i.test(message); }
+export function isHumanEscalationRequest(message: string): boolean { return /\b(?:speak|talk|connect)\s+(?:to|with)\s+(?:you\s+)?(?:a\s+)?(?:human|person|agent|representative)|\bhuman\s+(?:support|help|agent)\b/i.test(message); }
+export function isCapabilityInquiry(message: string): boolean {
+  return /\b(?:what|which|tell|show)\b[^.!?]{0,64}\b(?:can\s+you\s+do|you\s+can\s+do|can\s+i\s+(?:do|ask)|do\s+you\s+(?:actually\s+)?(?:do|help\s+with))\b|\b(?:help|support)\s+(?:topics?|options?|available)\b/i.test(message);
+}
 export function extractFraudAmount(message: string): number | undefined { const clauses = message.split(/[.!?;]+/).filter((clause) => /unauthori[sz]ed|never made|didn['’]t authori[sz]e|did not authori[sz]e|without permission|don['’]t recognize|stolen|take.?over/i.test(clause)); const values = clauses.flatMap((clause) => [...clause.matchAll(money)].map((match) => Number(match[1]))).filter(Number.isFinite); return values.length === 1 ? values[0] : undefined; }
 export function isRefundRequest(message: string) { return !isRefundStatusInquiry(message) && /\brefund\b/i.test(message); }
 export function isImmediateCancellation(message: string) { return !/\b(?:do not|don['’]t)\s+cancel\b/i.test(message) && /\b(?:immediate(?:ly)?|cancel(?:lation)?)\b/i.test(message); }

@@ -18,6 +18,8 @@ export interface SupportSession {
   pendingRefund: PendingRefund | null;
   /** The current pending transaction has already passed the ownership lookup. */
   loadedTransactionId: string | null;
+  /** Most recent owned transaction, retained after an action workflow ends. */
+  lastReferencedTransactionId: string | null;
   /** Most recent confirmed handoff in this support session. */
   lastEscalation: EscalationContext | null;
   /** Card-support intent retained only while collecting verification details. */
@@ -31,6 +33,7 @@ export const newSession = (): SupportSession => ({
   suppliedCardLast4: null,
   pendingRefund: null,
   loadedTransactionId: null,
+  lastReferencedTransactionId: null,
   lastEscalation: null,
   pendingCardIntent: null,
 });

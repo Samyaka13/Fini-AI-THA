@@ -7,7 +7,8 @@ import { getTransaction } from "./getTransaction.js";
 import { issueRefund, type IssueRefundResult } from "./issueRefund.js";
 
 export type ToolName = "get_customer" | "get_transaction" | "issue_refund" | "escalate_to_human";
-export interface ToolTrace { tool: ToolName; args: Record<string, unknown>; result: Record<string, unknown>; }
+export type ToolOrigin = "llm" | "manager" | "policy";
+export interface ToolTrace { tool: ToolName; origin: ToolOrigin; args: Record<string, unknown>; result: Record<string, unknown>; }
 
 /** Security boundary. Only these methods are available to the graph/tool caller. */
 export class SafeToolExecutor {
@@ -17,7 +18,7 @@ export class SafeToolExecutor {
     const result = getCustomer(this.store, email);
     // The trusted result is returned to verification code, but trace consumers
     // (including an LLM/transcript) learn only whether a record matched.
-    this.traces.push({ tool: "get_customer", args: { email: "[redacted]" }, result: { found: result.found } });
+    this.traces.push({ tool: "get_customer", origin: "manager", args: { email: "[redacted]" }, result: { found: result.found } });
     return result;
   }
   getOwnedTransaction(session: SupportSession, txnId: string) {
@@ -43,7 +44,7 @@ export class SafeToolExecutor {
   }
   escalate(customerId: string | null, summary: string) { return this.record("escalate_to_human", { customer_id: customerId, summary }, escalateToHuman(this.store, customerId, summary, this.now())); }
   private record<T extends object>(tool: ToolName, args: Record<string, unknown>, result: T): T {
-    this.traces.push({ tool, args, result: result as Record<string, unknown> });
+    this.traces.push({ tool, origin: "manager", args, result: result as Record<string, unknown> });
     return result;
   }
 }
