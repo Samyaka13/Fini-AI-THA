@@ -15,4 +15,6 @@ export interface TransactionView {
   date: string;
   merchant: string;
   status: TransactionStatus;
+  /** Present only when an authoritative refund record exists. */
+  refund: { id: string; amount: number } | null;
 }

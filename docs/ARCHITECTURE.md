@@ -7,3 +7,5 @@
 The graph parses the request, runs trusted verification where needed, routes mandatory escalations, obtains an owned transaction, evaluates refund policy, and then reaches the refund execution boundary. `SafeToolExecutor` is the only application path to tools. It checks session verification, ownership, refund eligibility, and suspected fraud again before calling the low-level refund mock.
 
 `MockStore` owns mutable in-memory customer, transaction, refund, and ticket data. Trusted customer records never enter graph responses. Tool traces redact email values and hold only safe result shapes.
+
+`SupportSession.pendingRefund` retains the customer-selected transaction ID and an explicitly stated requested amount across turns. It is updated only from trusted user input. Tool arguments from the model must match this pending state, so a model cannot invent a transaction or amount.

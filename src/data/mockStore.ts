@@ -17,6 +17,7 @@ export class MockStore {
   findCustomerByEmail(email: string) { return this.customers.find((c) => c.email.toLowerCase() === email.toLowerCase()); }
   findCustomerById(id: string) { return this.customers.find((c) => c.id === id); }
   findTransaction(id: string) { return this.transactions.find((t) => t.id === id); }
+  findRefundByTransaction(transactionId: string) { return this.refunds.find((refund) => refund.transactionId === transactionId); }
   recordRefund(transaction: TransactionRecord, amount: number): RefundRecord {
     const refund = { id: createId("rfd"), transactionId: transaction.id, amount };
     transaction.refunded = true; transaction.status = "refunded"; this.refunds.push(refund); return refund;

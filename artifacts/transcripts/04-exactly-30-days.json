@@ -29,7 +29,8 @@
               "amount": 35,
               "date": "2026-09-12",
               "merchant": "Old Store",
-              "status": "settled"
+              "status": "settled",
+              "refund": null
             }
           }
         },

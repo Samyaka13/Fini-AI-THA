@@ -29,7 +29,8 @@
               "amount": 40,
               "date": "2026-10-05",
               "merchant": "Metro Market",
-              "status": "settled"
+              "status": "settled",
+              "refund": null
             }
           }
         },

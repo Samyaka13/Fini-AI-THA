@@ -6,13 +6,18 @@ import { FIXED_NOW } from "../../src/utils/dates.js";
 
 const session = () => ({ ...newSession(), verified: true, customerId: "cus_alice" });
 describe("refund eligibility", () => {
-  it("accepts the $75 boundary and a valid partial refund", () => {
+  it("accepts a full refund at the $75 original-charge boundary", () => {
     const transaction = new MockStore().findTransaction("txn_exact_75")!;
     expect(refundEligibility({ session: session(), transaction, amount: 75, now: FIXED_NOW, suspectedFraud: false })).toEqual({ eligible: true });
   });
+  it("rejects partial refunds and original charges above the automatic cap", () => {
+    const store = new MockStore();
+    expect(refundEligibility({ session: session(), transaction: store.findTransaction("txn_recent_40"), amount: 30, now: FIXED_NOW, suspectedFraud: false })).toMatchObject({ reason: "partial_not_allowed" });
+    expect(refundEligibility({ session: session(), transaction: store.findTransaction("txn_over_cap"), amount: 60, now: FIXED_NOW, suspectedFraud: false })).toMatchObject({ reason: "original_amount_over_cap" });
+  });
   it("rejects cap, age, pending, duplicates, ownership, and fraud", () => {
     const store = new MockStore();
-    expect(refundEligibility({ session: session(), transaction: store.findTransaction("txn_over_cap"), amount: 76, now: FIXED_NOW, suspectedFraud: false })).toMatchObject({ reason: "over_cap" });
+    expect(refundEligibility({ session: session(), transaction: store.findTransaction("txn_over_cap"), amount: 76, now: FIXED_NOW, suspectedFraud: false })).toMatchObject({ reason: "original_amount_over_cap" });
     expect(refundEligibility({ session: session(), transaction: store.findTransaction("txn_exact_30"), amount: 35, now: FIXED_NOW, suspectedFraud: false })).toMatchObject({ reason: "too_old" });
     expect(refundEligibility({ session: session(), transaction: store.findTransaction("txn_pending"), amount: 22, now: FIXED_NOW, suspectedFraud: false })).toMatchObject({ reason: "pending" });
     expect(refundEligibility({ session: session(), transaction: store.findTransaction("txn_bob"), amount: 20, now: FIXED_NOW, suspectedFraud: false })).toMatchObject({ reason: "not_owner" });

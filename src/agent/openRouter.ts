@@ -10,7 +10,17 @@ export interface LlmCompletion {
   content: string | null; 
   toolCalls: LlmToolCall[]; 
 }
-export interface LlmClient { complete(messages: LlmMessage[]): Promise<LlmCompletion>; }
+export const structuredInterpretationSchema = z.object({
+  intent: z.enum(["refund_request", "transaction_lookup", "refund_status", "card_status", "frozen_card_help", "fraud_report", "human_escalation", "account_closure", "legal_action", "unknown"]),
+  amount: z.number().finite().positive().optional(),
+  transactionId: z.string().regex(/^txn_[a-z0-9_]+$/i).optional(),
+});
+export type StructuredInterpretation = z.infer<typeof structuredInterpretationSchema>;
+export interface LlmClient {
+  complete(messages: LlmMessage[]): Promise<LlmCompletion>;
+  /** Optional low-authority extraction pass for unresolved natural language. */
+  interpret?(sanitizedInput: string): Promise<StructuredInterpretation | null>;
+}
 
 export const OPENROUTER_TOOLS = [
   { type: "function", function: { name: "get_customer", description: "Verify only after the customer gives email and card last four. Never reveal record fields.", parameters: { type: "object", properties: { email: { type: "string" } }, required: ["email"], additionalProperties: false } } },
@@ -89,9 +99,30 @@ export class OpenRouterClient implements LlmClient {
       )
     };
   }
+  async interpret(sanitizedInput: string): Promise<StructuredInterpretation | null> {
+    const response = await this.fetcher("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${this.apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "google/gemini-3.8-flash",
+        messages: [
+          { role: "system", content: "Classify the support message and extract only candidate intent, positive amount, and transaction ID. Return JSON only. Do not infer identity, verification, approval, or outcomes." },
+          { role: "user", content: sanitizedInput },
+        ],
+        response_format: { type: "json_object" },
+        temperature: 0,
+        max_tokens: 120,
+      }),
+    });
+    const parsed = schema.safeParse(await response.json());
+    if (!response.ok || !parsed.success) return null;
+    const content = parsed.data.choices[0]!.message.content;
+    if (!content) return null;
+    try { return structuredInterpretationSchema.safeParse(JSON.parse(content)).data ?? null; } catch { return null; }
+  }
 }
 export function parseToolArguments(call: LlmToolCall): Record<string, unknown> | null { try { const parsed: unknown = JSON.parse(call.function.arguments); return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null; } catch { return null; } }
 export function sanitizeForLlm(content: string): string {
   if (/^\s*\d{4}\s*$/.test(content)) return "[card-last-four]";
-  return content.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[account-email]").replace(/(?:last\s*(?:four|4)\s*(?:digits)?|card)\D{0,12}\d{4}/gi, "[card-last-four]");
+  return content.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[account-email]").replace(/(?:last\s*(?:four|4)\s*(?:digits)?|card(?:[\s_-]*last\s*4)?)\D{0,12}\d{4}/gi, "[card-last-four]");
 }

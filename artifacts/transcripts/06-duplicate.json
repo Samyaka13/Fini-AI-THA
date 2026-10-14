@@ -29,7 +29,8 @@
               "amount": 20,
               "date": "2026-10-05",
               "merchant": "Music Stream",
-              "status": "refunded"
+              "status": "refunded",
+              "refund": null
             }
           }
         }

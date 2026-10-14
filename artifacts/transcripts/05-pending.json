@@ -29,7 +29,8 @@
               "amount": 22,
               "date": "2026-10-11",
               "merchant": "Coffee Corner",
-              "status": "pending"
+              "status": "pending",
+              "refund": null
             }
           }
         }

@@ -19,6 +19,7 @@ describe("OpenRouter integration", () => {
 
   it("redacts identifiers before a provider call", () => {
     expect(sanitizeForLlm("Email alice@example.com, card last four digits are 4242.")).toBe("Email [account-email], card [card-last-four].");
+    expect(sanitizeForLlm("email: alice@example.com cardLast4: 4242")).toBe("email: [account-email] [card-last-four]");
     expect(sanitizeForLlm("4821")).not.toContain("4821");
     expect(sanitizeForLlm("Refund $7500 for txn_1234")).toContain("$7500 for txn_1234");
   });

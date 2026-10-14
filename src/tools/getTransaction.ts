@@ -6,5 +6,15 @@ export type GetTransactionResult = { found: true; transaction: TransactionView }
 export function getTransaction(store: MockStore, customerId: string, txnId: string): GetTransactionResult {
   const transaction = store.findTransaction(txnId);
   if (!transaction || transaction.customerId !== customerId) return { found: false, reason: "not_found_or_not_owned" };
-  return { found: true, transaction: { amount: transaction.amount, date: transaction.date, merchant: transaction.merchant, status: transaction.status } };
+  const refund = store.findRefundByTransaction(transaction.id);
+  return {
+    found: true,
+    transaction: {
+      amount: transaction.amount,
+      date: transaction.date,
+      merchant: transaction.merchant,
+      status: transaction.status,
+      refund: refund ? { id: refund.id, amount: refund.amount } : null,
+    },
+  };
 }

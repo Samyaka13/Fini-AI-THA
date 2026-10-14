@@ -6,7 +6,7 @@
   "transcript": [
     {
       "user": "My email is [redacted-email] and my card last four digits are [redacted]. Why is my card frozen?",
-      "response": "Your card is frozen. I can’t access the reason, so I’ve sent this to a specialist (ticket tkt_0005).",
+      "response": "The account record shows your card as frozen. I can’t access the reason, so I’ve sent this to a specialist (ticket tkt_0005).",
       "tools": [
         {
           "tool": "get_customer",
@@ -18,10 +18,20 @@
           }
         },
         {
+          "tool": "get_customer",
+          "args": {
+            "customer_id": "[verified-session]"
+          },
+          "result": {
+            "found": true,
+            "status": "frozen"
+          }
+        },
+        {
           "tool": "escalate_to_human",
           "args": {
             "customer_id": "cus_frozen",
-            "summary": "frozen-card enquiry"
+            "summary": "frozen-card status enquiry"
           },
           "result": {
             "ticket_id": "tkt_0005"

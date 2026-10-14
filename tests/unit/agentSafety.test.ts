@@ -54,4 +54,11 @@ describe("agent safety and OpenRouter orchestration", () => {
     expect(result.traces.map((trace) => trace.tool)).not.toContain("escalate_to_human");
     expect(result.response).toContain("can’t find that transaction");
   });
+  it("stores each user and final assistant message once across fallback turns", async () => {
+    const agent = new PaylaneAgent({ llm: null });
+    await agent.respond("hello");
+    const second = await agent.respond("hello again");
+    expect(second.messages.map((message) => message.role)).toEqual(["user", "assistant", "user", "assistant"]);
+    expect(second.messages).toHaveLength(4);
+  });
 });

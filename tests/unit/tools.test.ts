@@ -14,9 +14,14 @@ describe("mock tools and security boundary", () => {
   it("enforces policy at refund execution and blocks duplicates", () => {
     const store = new MockStore(); const executor = new SafeToolExecutor(store, () => FIXED_NOW);
     const session = { ...newSession(), verified: true, customerId: "cus_alice" };
-    expect(executor.executeRefund(session, "txn_over_cap", 120, false)).toMatchObject({ ok: false, reason: "policy_over_cap" });
+    expect(executor.executeRefund(session, "txn_over_cap", 120, false)).toMatchObject({ ok: false, reason: "policy_original_amount_over_cap" });
     expect(executor.executeRefund(session, "txn_recent_40", 40, false)).toMatchObject({ ok: true });
     expect(executor.executeRefund(session, "txn_recent_40", 40, false)).toMatchObject({ ok: false, reason: "policy_already_refunded" });
+  });
+  it("rejects partial refunds at the executor and low-level mock boundary", () => {
+    const executor = new SafeToolExecutor(new MockStore(), () => FIXED_NOW);
+    const session = { ...newSession(), verified: true, customerId: "cus_alice" };
+    expect(executor.executeRefund(session, "txn_recent_40", 30, false)).toMatchObject({ ok: false, reason: "policy_partial_not_allowed" });
   });
   it("creates ticket IDs, including anonymous tickets", () => {
     const executor = new SafeToolExecutor(new MockStore(), () => FIXED_NOW);

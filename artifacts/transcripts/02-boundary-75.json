@@ -26,10 +26,11 @@
           "result": {
             "found": true,
             "transaction": {
-              "amount": 100,
+              "amount": 75,
               "date": "2026-10-06",
               "merchant": "City Books",
-              "status": "settled"
+              "status": "settled",
+              "refund": null
             }
           }
         },

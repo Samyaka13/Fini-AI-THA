@@ -11,3 +11,11 @@ Rerun: `npm run build && npm test` passed: 6 test files and 17 tests, including 
 ## Provider boundary
 
 No live OpenRouter request was executed during evaluation. Unit tests use a mocked provider to verify protocol formatting, tool-call IDs, malformed-message handling, and PII redaction; scenarios run offline through the actual LangGraph workflow.
+
+## Multi-turn refund regression
+
+During this change, the first test run exposed a real regression: an empty LLM completion called the fallback with an empty trusted-input value. The fallback could not recover the customer's verified refund request, so the existing deterministic-policy test observed no `issue_refund` trace.
+
+Fix: pass the graph state's per-turn trusted input into the response-safety fallback, remove the class-level `trustedInput`, and persist transaction/amount context in `SupportSession.pendingRefund`.
+
+Rerun: `npm run build && npm test` passed with 8 test files and 23 tests. The regression suite includes the three-turn $30 partial-refund conversation, safe validation-failure tracing, and message-history uniqueness.
