@@ -34,12 +34,10 @@ export class PaylaneAgent {
     const start = this.executor.traces.length;
     const state = await this.graph.invoke({ messages: [...this.messages, { role: "user", content: sanitizeForLlm(input) }], response: "", session: this.session, traces: [], llmToolCalls: [], llmError: null, currentInput: input, traceStart: start });
     this.messages = state.messages; this.session = structuredClone(state.session);
-    this.logGraphState("=== FINAL GRAPH STATE ===", state);
     return { response: state.response, session: structuredClone(state.session), traces: state.traces, llmToolCalls: state.llmToolCalls.map((call) => call.function.name), llmError: state.llmError, messages: structuredClone(state.messages) };
   }
 
   private async runCycle(state: AgentStateValue): Promise<Partial<AgentStateValue>> {
-    this.logGraphState("=== TOOL_CYCLE: INPUT STATE ===", state);
     // The raw current turn is parsed locally first. If that leaves a useful
     // ambiguity, the small structured-extraction request supplies only
     // low-authority candidates; reconciliation still happens locally before
@@ -117,8 +115,6 @@ export class PaylaneAgent {
       const errorMessage =
         error instanceof Error ? error.message : "LLM unavailable";
     
-      console.error("[OpenRouter] Request failed:", errorMessage);
-    
       const turnTraces = this.executor.traces.slice(traceStart);
     
       // Never tell the user to retry if an action already succeeded.
@@ -174,7 +170,6 @@ export class PaylaneAgent {
     if (call.function.name === "get_transaction") {
       const requestedTxnId = pending?.transactionId ?? extractTransactionId(raw);
       const valid = getTransactionSchema.safeParse({ customer_id: session.customerId ?? "", txn_id: args.txn_id }).success;
-      this.logToolDecision("get_transaction", { verified: session.verified, hasPendingRefund: Boolean(pending), hasRequestedTransaction: Boolean(requestedTxnId), argumentsValid: valid });
       const safeArgs = { txn_id: typeof args.txn_id === "string" ? args.txn_id : "[missing]" };
       if (!requestedTxnId) return { call, session, result: this.executor.recordValidationFailure("get_transaction", safeArgs, "missing_transaction_id") };
       if (!valid || args.txn_id !== requestedTxnId) return { call, session, result: this.executor.recordValidationFailure("get_transaction", safeArgs, "invalid_transaction_request") };
@@ -295,7 +290,6 @@ export class PaylaneAgent {
     const next = transactionId && transactionId !== prior.transactionId
       ? { ...base, pendingRefund: { transactionId, requestedAmount: safeAmount ?? null }, loadedTransactionId: null }
       : { ...base, pendingRefund: { transactionId: prior.transactionId, requestedAmount: safeAmount ?? prior.requestedAmount } };
-    this.logRefundState("pending-refund-updated", next, safeAmount);
     return next;
   }
   private isRecentTransactionReference(raw: string): boolean {
@@ -511,45 +505,9 @@ export class PaylaneAgent {
     if (!("transaction" in found)) return { session, found: false, alreadyLoaded: false, reason: found.reason };
     return { session: { ...session, loadedTransactionId: txnId, lastReferencedTransactionId: txnId }, found: true, alreadyLoaded: false, transaction: found.transaction };
   }
-  private logRefundState(stage: string, session: SupportSession, parsedAmount: number | undefined): void {
-    if (process.env.PAYLANE_DEBUG !== "true") return;
-    console.debug("[refund-state]", { stage, transactionSelected: Boolean(session.pendingRefund?.transactionId), amountProvided: session.pendingRefund?.requestedAmount !== null, parsedAmount: parsedAmount ?? null });
-  }
-  private logToolDecision(tool: ToolName, details: Record<string, boolean>): void {
-    if (process.env.PAYLANE_DEBUG === "true") console.debug("[tool-validation]", { tool, ...details });
-  }
   private markLatestTrace(origin: "manager" | "policy"): void {
     const latest = this.executor.traces.at(-1);
     if (latest) latest.origin = origin;
-  }
-  private logGraphState(label: string, state: AgentStateValue): void {
-    // Keep the labels and workflow visibility of the original diagnostics, while
-    // explicitly excluding trusted input and customer verification secrets.
-    console.log(label);
-    console.dir({
-      messages: state.messages,
-      response: state.response,
-      session: {
-        verified: state.session.verified,
-        customerId: state.session.customerId ? "[verified-customer]" : null,
-        suppliedEmail: state.session.suppliedEmail ? "[redacted]" : null,
-        suppliedCardLast4: state.session.suppliedCardLast4 ? "[redacted]" : null,
-        pendingRefund: state.session.pendingRefund,
-        loadedTransactionId: state.session.loadedTransactionId,
-        hasLastEscalation: state.session.lastEscalation !== null,
-      },
-      traces: state.traces.map((trace) => ({
-        ...trace,
-        args: {
-          ...trace.args,
-          ...(trace.args.customer_id ? { customer_id: "[redacted]" } : {}),
-          ...(trace.args.email ? { email: "[redacted]" } : {}),
-        },
-      })),
-      llmToolCalls: state.llmToolCalls.map((call) => call.function.name),
-      llmError: state.llmError,
-      currentInput: "[trusted input omitted]",
-    }, { depth: null });
   }
   private safeFinalResponse(content: string, traces: ToolTrace[]): string {
     const successfulRefund = traces.some((trace) => trace.tool === "issue_refund" && trace.result.ok === true);
